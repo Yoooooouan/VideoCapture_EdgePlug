@@ -412,6 +412,7 @@
       });
       if (resp && resp.error) {
         showProgress(videoMedia.id, -1, '❌ ' + resp.error);
+        if (resp.diagnostics) showDiagnostics(videoMedia.id, resp.diagnostics);
         setButtonsDisabled(videoMedia.id, false);
       }
       // 成功则等待 DOWNLOAD_PROGRESS 消息
@@ -437,6 +438,7 @@
       });
       if (resp && resp.error) {
         showProgress(media.id, -1, '❌ ' + resp.error);
+        if (resp.diagnostics) showDiagnostics(media.id, resp.diagnostics);
         setButtonsDisabled(media.id, false);
       }
       // 成功则等待 DOWNLOAD_PROGRESS 消息
@@ -474,6 +476,7 @@
       });
       if (resp && resp.error) {
         showProgress(media.id, -1, '❌ ' + resp.error);
+        if (resp.diagnostics) showDiagnostics(media.id, resp.diagnostics);
         setButtonsDisabled(media.id, false);
       }
     } catch (e) {
@@ -522,6 +525,98 @@
     if (vBtn) vBtn.disabled = disabled;
     if (aBtn) aBtn.disabled = disabled;
     if (mBtn) mBtn.disabled = disabled;
+  }
+
+  // ==================== 错误诊断面板 + Bug 报告 ====================
+
+  function codecNameShort(fourcc) {
+    const c = (fourcc || '').toLowerCase();
+    if (c.startsWith('avc1') || c.startsWith('avc3')) return 'H.264';
+    if (c.startsWith('hev1') || c.startsWith('hvc1')) return 'H.265';
+    if (c.startsWith('av01')) return 'AV1';
+    if (c.startsWith('vp09')) return 'VP9';
+    if (c.startsWith('mp4a')) return 'AAC';
+    if (c.startsWith('flac')) return 'FLAC';
+    if (c.startsWith('opus')) return 'Opus';
+    if (c.startsWith('ec-3')) return 'E-AC-3';
+    return fourcc || '未知';
+  }
+
+  function copyToClipboard(text) {
+    // 优先用现代 Clipboard API，失败则降级到 execCommand
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      return navigator.clipboard.writeText(text).catch(() => fallbackCopy(text));
+    }
+    return fallbackCopy(text);
+  }
+
+  function fallbackCopy(text) {
+    return new Promise((resolve, reject) => {
+      try {
+        const ta = document.createElement('textarea');
+        ta.value = text;
+        ta.style.cssText = 'position:fixed;left:-9999px;top:0;';
+        document.body.appendChild(ta);
+        ta.select();
+        const ok = document.execCommand('copy');
+        document.body.removeChild(ta);
+        if (ok) resolve();
+        else reject(new Error('execCommand 返回 false'));
+      } catch (e) { reject(e); }
+    });
+  }
+
+  // 在卡片下方渲染诊断摘要 + "复制 Bug 报告"按钮
+  function showDiagnostics(mediaId, diagnostics) {
+    const cardId = resolveCardId(mediaId);
+    const card = document.getElementById(`card-${cardId}`);
+    if (!card || !diagnostics) return;
+
+    // 移除旧诊断面板（同一卡片重复出错时覆盖）
+    const old = document.getElementById(`diag-${cardId}`);
+    if (old) old.remove();
+
+    const panel = document.createElement('div');
+    panel.id = `diag-${cardId}`;
+    panel.style.cssText = 'margin-top:8px;padding:10px 12px;background:#fff8e1;border:1px solid #ffca28;border-radius:8px;font-size:11px;color:#5d4037;line-height:1.5;';
+
+    // 摘要：codec 检测 + 文件类型 + 第一条建议
+    const codecStr = diagnostics.codecs && diagnostics.codecs.length
+      ? diagnostics.codecs.map(c => `${c} (${codecNameShort(c)})`).join(', ')
+      : '未识别';
+    const suggestion = (diagnostics.suggestions && diagnostics.suggestions[0]) || '已生成诊断报告';
+    const videoErr = diagnostics.videoError
+      ? `${diagnostics.videoError.codeName} (code=${diagnostics.videoError.code})`
+      : '未触发';
+
+    panel.innerHTML = `
+      <div style="font-weight:600;margin-bottom:4px;color:#e65100;">🔍 自动诊断</div>
+      <div>检测到 codec：<b>${escapeHtml(codecStr)}</b></div>
+      <div>视频元素错误：<b>${escapeHtml(videoErr)}</b></div>
+      <div>fragmented MP4：${diagnostics.isFMP4 ? '是' : '否'}</div>
+      <div style="margin:4px 0;color:#bf360c;">${escapeHtml(suggestion)}</div>
+      <button class="btn btn-secondary" id="diagbtn-${cardId}"
+        style="margin-top:6px;padding:5px 10px;font-size:11px;flex:none;">📋 复制 Bug 报告</button>`;
+
+    card.appendChild(panel);
+
+    const btn = document.getElementById(`diagbtn-${cardId}`);
+    if (btn) {
+      btn.addEventListener('click', () => {
+        const report = diagnostics.bugReport || JSON.stringify(diagnostics, null, 2);
+        copyToClipboard(report).then(() => {
+          btn.textContent = '✅ 已复制到剪贴板';
+          btn.disabled = true;
+          setTimeout(() => {
+            btn.textContent = '📋 复制 Bug 报告';
+            btn.disabled = false;
+          }, 2000);
+        }).catch(() => {
+          btn.textContent = '❌ 复制失败，请查看控制台';
+          console.error('[VC] Bug 报告复制失败，内容如下：\n', report);
+        });
+      });
+    }
   }
 
   // ==================== 辅助函数 ====================

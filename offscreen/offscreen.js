@@ -9,6 +9,280 @@
 (function () {
   'use strict';
 
+  // ==================== 视频解码诊断工具 ====================
+  // 出错时自动收集 codec / 浏览器支持 / video.error 详情，
+  // 生成可直接提交给开发者的 markdown Bug 报告。
+
+  // 解析 ISO BMFF (MP4/fMP4) 盒子，从 stsd 中提取 codec 四字符码。
+  // B站 m4s baseUrl 通常是带 moov 的完整 fMP4，可解析。
+  function detectCodecFromMP4(buffer) {
+    const u8 = new Uint8Array(buffer);
+    const view = new DataView(buffer);
+    const found = new Set();
+    const CONTAINERS = new Set(['moov', 'trak', 'mdia', 'minf', 'stbl', 'udta', 'edts', 'mvex', 'moof', 'traf']);
+
+    function readBox(pos, end, depth) {
+      if (depth > 8) return;
+      while (pos + 8 <= end) {
+        let size = view.getUint32(pos, false);
+        const type = String.fromCharCode(u8[pos + 4], u8[pos + 5], u8[pos + 6], u8[pos + 7]);
+        let headerSize = 8;
+        if (size === 1) {
+          if (pos + 16 > end) return;
+          const hi = view.getUint32(pos + 8, false);
+          const lo = view.getUint32(pos + 12, false);
+          size = hi * 0x100000000 + lo;
+          headerSize = 16;
+        } else if (size === 0) {
+          size = end - pos;
+        }
+        if (size < 8) return;
+        const bodyStart = pos + headerSize;
+        const bodyEnd = Math.min(pos + size, end);
+
+        if (type === 'stsd') {
+          // stsd: version(1) + flags(3) + entry_count(4) + entries
+          if (bodyStart + 8 <= bodyEnd) {
+            const entryCount = view.getUint32(bodyStart + 4, false);
+            let ep = bodyStart + 8;
+            for (let i = 0; i < entryCount && ep + 8 <= bodyEnd; i++) {
+              const esize = view.getUint32(ep, false);
+              const codec = String.fromCharCode(u8[ep + 4], u8[ep + 5], u8[ep + 6], u8[ep + 7]);
+              if (/^[a-zA-Z0-9. -]{4}$/.test(codec)) found.add(codec);
+              if (esize < 8) break;
+              ep += esize;
+            }
+          }
+        } else if (CONTAINERS.has(type)) {
+          readBox(bodyStart, bodyEnd, depth + 1);
+        }
+        pos += size;
+      }
+    }
+
+    try {
+      // 只扫前 10MB，避免大文件阻塞
+      readBox(0, Math.min(buffer.byteLength, 10 * 1024 * 1024), 0);
+    } catch (e) {}
+    return [...found];
+  }
+
+  // 检测浏览器对各类 codec 的支持情况（canPlayType + MediaSource.isTypeSupported）
+  function checkCodecSupport() {
+    const results = {};
+    const video = document.createElement('video');
+    const tests = [
+      ['avc1', 'video/mp4; codecs="avc1.42E01E"'],
+      ['avc3', 'video/mp4; codecs="avc3.42E01E"'],
+      ['hev1', 'video/mp4; codecs="hev1.1.6.L93.B0"'],
+      ['hvc1', 'video/mp4; codecs="hvc1.1.6.L93.B0"'],
+      ['av01', 'video/mp4; codecs="av01.0.05M.08"'],
+      ['vp9',  'video/webm; codecs="vp9"'],
+      ['mp4a', 'audio/mp4; codecs="mp4a.40.2"'],
+      ['fLaC', 'audio/mp4; codecs="fLaC"'],
+      ['Opus', 'audio/mp4; codecs="Opus"'],
+    ];
+    for (const [name, mime] of tests) {
+      try { results[name] = video.canPlayType(mime) || 'no'; } catch (e) { results[name] = 'error'; }
+    }
+    results._MediaSource = typeof MediaSource !== 'undefined';
+    if (results._MediaSource) {
+      for (const [name, mime] of tests) {
+        try { results['MS_' + name] = MediaSource.isTypeSupported(mime); } catch (e) { results['MS_' + name] = 'error'; }
+      }
+    }
+    return results;
+  }
+
+  function describeVideoError(videoEl) {
+    const err = videoEl && videoEl.error;
+    if (!err) return null;
+    const codeMap = {
+      1: 'MEDIA_ERR_ABORTED',
+      2: 'MEDIA_ERR_NETWORK',
+      3: 'MEDIA_ERR_DECODE',
+      4: 'MEDIA_ERR_SRC_NOT_SUPPORTED',
+    };
+    return {
+      code: err.code,
+      codeName: codeMap[err.code] || 'UNKNOWN',
+      message: err.message || '',
+    };
+  }
+
+  function bufferToHex(buffer, maxBytes) {
+    const u8 = new Uint8Array(buffer);
+    const n = Math.min(u8.length, maxBytes || 64);
+    let s = '';
+    for (let i = 0; i < n; i++) {
+      s += u8[i].toString(16).padStart(2, '0') + ' ';
+      if ((i + 1) % 16 === 0) s += '\n';
+    }
+    return s.trim();
+  }
+
+  // 检测是否 fragmented MP4：含 styp/sidx/moof 任一即认为是
+  function detectFMP4(buffer) {
+    const u8 = new Uint8Array(buffer);
+    const len = Math.min(u8.length, 1024 * 1024);
+    const tags = ['styp', 'sidx', 'moof'];
+    const text = [];
+    for (let i = 0; i < len; i++) text.push(String.fromCharCode(u8[i]));
+    const head = text.join('');
+    return tags.some(t => head.includes(t));
+  }
+
+  function codecName(fourcc) {
+    const c = (fourcc || '').toLowerCase();
+    if (c.startsWith('avc1') || c.startsWith('avc3')) return 'H.264';
+    if (c.startsWith('hev1') || c.startsWith('hvc1')) return 'H.265 (HEVC)';
+    if (c.startsWith('av01')) return 'AV1';
+    if (c.startsWith('vp09')) return 'VP9';
+    if (c.startsWith('mp4a')) return 'AAC';
+    if (c.startsWith('flac')) return 'FLAC';
+    if (c.startsWith('opus')) return 'Opus';
+    if (c.startsWith('ec-3')) return 'E-AC-3';
+    return fourcc;
+  }
+
+  // 基于诊断结果给出可执行的修复建议
+  function generateSuggestions(codecs, support, scenario) {
+    const s = [];
+    const videoCodecs = (codecs || []).filter(c => !/^(mp4a|flac|opus|ec-3)/i.test(c));
+    const hasHEVC = videoCodecs.some(c => /hev1|hvc1/i.test(c));
+    const hasAV1 = videoCodecs.some(c => /av01/i.test(c));
+    const hasAVC = videoCodecs.some(c => /avc1|avc3/i.test(c));
+
+    if (hasHEVC && support.hev1 === '' && !support._MediaSourceHandled) {
+      s.push('⚠️ 检测到 H.265 (HEVC) 视频流，Chrome 默认不解 HEVC。');
+      s.push('   → 请在清晰度下拉中切换到标注 (H.264) 的选项；4K 可能仅有 H.265，无法播放。');
+    } else if (hasHEVC) {
+      s.push('⚠️ 检测到 H.265 (HEVC) 视频流，当前浏览器不支持硬解。');
+      s.push('   → 切换到 H.264 清晰度；或在 Chrome 地址栏访问 chrome://flags/#enable-experimental-web-platform-features 排查。');
+    }
+    if (hasAV1 && support.av01 === '') {
+      s.push('⚠️ 检测到 AV1 视频流，当前 Chrome 不解 AV1。');
+      s.push('   → 切换到 H.264/H.265 清晰度。');
+    }
+    if (!hasAVC && (hasHEVC || hasAV1)) {
+      s.push('ℹ️ 该清晰度未提供 H.264 版本，Chrome 几乎必然无法解码。');
+    }
+    if (videoCodecs.length === 0) {
+      s.push('⚠️ 未从视频流中识别出任何视频 codec，可能不是有效的 MP4/fMP4 文件。');
+      s.push('   → 检查下载链接是否完整（B站 m4s 的 baseUrl 应包含 init segment）。');
+    }
+    if (s.length === 0) {
+      s.push('ℹ️ 未识别出明确的 codec 兼容性问题，可能是 fragmented MP4 缺失 init segment 或文件损坏。');
+    }
+    return s;
+  }
+
+  function formatBytes(n) {
+    if (!n && n !== 0) return 'unknown';
+    if (n < 1024) return n + ' B';
+    if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
+    if (n < 1024 * 1024 * 1024) return (n / 1024 / 1024).toFixed(2) + ' MB';
+    return (n / 1024 / 1024 / 1024).toFixed(2) + ' GB';
+  }
+
+  // 生成可直接提交的 markdown Bug 报告
+  function generateBugReport(ctx) {
+    const lines = [];
+    lines.push('## Bug 报告：视频解码失败（格式不支持）');
+    lines.push('');
+    lines.push('### 错误概述');
+    lines.push('- 错误信息：' + (ctx.error || '视频解码失败'));
+    lines.push('- 发生时间：' + new Date().toISOString());
+    lines.push('- 操作场景：' + (ctx.scenario || 'unknown'));
+    lines.push('');
+    lines.push('### 环境信息');
+    lines.push('- UserAgent：' + navigator.userAgent);
+    lines.push('- 平台：' + navigator.platform);
+    lines.push('- 扩展版本：1.0.0 (VideoCapture_EdgePlug)');
+    lines.push('- 来源页面：' + (ctx.pageUrl || '(请补充)'));
+    lines.push('');
+    lines.push('### 媒体信息');
+    if (ctx.videoUrl) {
+      // 音频提取场景下源流可能是音频流，标签需对应
+      const isAudioOnly = ctx.scenario === 'extract-audio' && !ctx.audioUrl;
+      const urlLabel = isAudioOnly ? '源流 URL' : '视频流 URL';
+      const sizeLabel = isAudioOnly ? '源流大小' : '视频流大小';
+      lines.push(`- ${urlLabel}：${ctx.videoUrl}`);
+      lines.push(`- ${sizeLabel}：${formatBytes(ctx.videoSize)}`);
+    }
+    if (ctx.audioUrl) {
+      lines.push('- 音频流 URL：' + ctx.audioUrl);
+      lines.push('- 音频流大小：' + formatBytes(ctx.audioSize));
+    }
+    if (ctx.qualityLabel) lines.push('- 选中清晰度：' + ctx.qualityLabel);
+    lines.push('');
+    lines.push('### 文件头分析');
+    lines.push('- 检测到 codec：' + (ctx.codecs && ctx.codecs.length ? ctx.codecs.map(c => `${c} (${codecName(c)})`).join(', ') : '未识别'));
+    lines.push('- 是否 fragmented MP4：' + (ctx.isFMP4 ? '是' : '否'));
+    lines.push('- 文件头(hex)：');
+    lines.push('```');
+    lines.push(ctx.headerHex || '(空)');
+    lines.push('```');
+    lines.push('');
+    lines.push('### 视频元素错误详情');
+    if (ctx.videoError) {
+      lines.push('- error.code：' + ctx.videoError.code + ' (' + ctx.videoError.codeName + ')');
+      lines.push('- error.message：' + (ctx.videoError.message || '(空)'));
+    } else {
+      lines.push('- (video.error 为空，可能 loadedmetadata 阶段即失败)');
+    }
+    lines.push('');
+    lines.push('### 浏览器 codec 支持检测');
+    for (const [k, v] of Object.entries(ctx.support || {})) {
+      lines.push('- ' + k + '：' + v);
+    }
+    lines.push('');
+    lines.push('### 自动诊断建议');
+    for (const sug of (ctx.suggestions || [])) lines.push(sug);
+    lines.push('');
+    lines.push('### 复现步骤');
+    let step = 1;
+    lines.push(`${step++}. 打开 ${ctx.pageUrl || '(请补充页面 URL)'}`);
+    lines.push(`${step++}. 点击浏览器工具栏的"视频抓取助手"扩展图标`);
+    if (ctx.qualityLabel) lines.push(`${step++}. 在清晰度下拉中选择「${ctx.qualityLabel}」`);
+    lines.push(`${step++}. 点击「下载视频+音频（推荐）」按钮`);
+    lines.push(`${step++}. 等待数秒后弹出"视频解码失败（格式不支持）"错误`);
+    lines.push('');
+    lines.push('---');
+    lines.push('请将以上内容复制提交到 Issue，开发者会根据 codec 检测与浏览器支持情况定位问题。');
+    return lines.join('\n');
+  }
+
+  // 组装诊断对象 + 带 diagnostics 的 Error
+  function buildDecodeError(videoBuffer, videoEl, scenario, extra) {
+    const codecs = detectCodecFromMP4(videoBuffer);
+    const support = checkCodecSupport();
+    const videoError = describeVideoError(videoEl);
+    const headerHex = bufferToHex(videoBuffer, 64);
+    const isFMP4 = detectFMP4(videoBuffer);
+    const suggestions = generateSuggestions(codecs, support, scenario);
+    const diagnostics = {
+      error: '视频解码失败（格式不支持）',
+      scenario,
+      codecs,
+      support,
+      videoError,
+      headerHex,
+      isFMP4,
+      videoSize: videoBuffer ? videoBuffer.byteLength : 0,
+      suggestions,
+      pageUrl: (extra && extra.pageUrl) || '',
+      videoUrl: (extra && extra.videoUrl) || '',
+      audioUrl: (extra && extra.audioUrl) || '',
+      audioSize: (extra && extra.audioSize) || 0,
+      qualityLabel: (extra && extra.qualityLabel) || '',
+    };
+    diagnostics.bugReport = generateBugReport(diagnostics);
+    const err = new Error('视频解码失败（格式不支持）');
+    err.diagnostics = diagnostics;
+    return err;
+  }
+
   // ==================== WAV 编码器 ====================
 
   function encodeWAV(audioBuffer) {
@@ -128,7 +402,7 @@
 
   // ==================== 实时音频提取（video 元素） ====================
 
-  function captureAudioFromVideo(arrayBuffer, mimeType) {
+  function captureAudioFromVideo(arrayBuffer, mimeType, ctx) {
     return new Promise((resolve, reject) => {
       const blob = new Blob([arrayBuffer], { type: mimeType || 'video/mp4' });
       const blobUrl = URL.createObjectURL(blob);
@@ -230,8 +504,10 @@
       };
 
       const onError = (e) => {
+        // 出错时自动检测 codec / 浏览器支持 / video.error，生成可提交的 Bug 报告
+        const err = buildDecodeError(arrayBuffer, video, 'extract-audio', ctx || {});
         cleanup();
-        reject(new Error('视频解码失败（格式不支持）'));
+        reject(err);
       };
 
       video.addEventListener('loadedmetadata', onLoadedMetadata, { once: true });
@@ -265,7 +541,7 @@
     return { mimeType: '', ext: 'webm' };
   }
 
-  function mergeVideoAudio(videoBuffer, audioBuffer, filename, mergeId, tabId) {
+  function mergeVideoAudio(videoBuffer, audioBuffer, filename, mergeId, tabId, ctx) {
     return new Promise((resolve, reject) => {
       // 创建独立的 video 和 audio 元素（不复用 hidden-video，避免 createMediaElementSource 冲突）
       const videoEl = document.createElement('video');
@@ -415,8 +691,10 @@
       };
 
       const onError = () => {
+        // 出错时自动检测 codec / 浏览器支持 / video.error，生成可提交的 Bug 报告
+        const err = buildDecodeError(videoBuffer, videoEl, 'merge-video-audio', ctx || {});
         cleanup();
-        reject(new Error('视频解码失败（格式不支持）'));
+        reject(err);
       };
 
       videoEl.addEventListener('loadedmetadata', onLoadedMetadata, { once: true });
@@ -443,19 +721,23 @@
     if (message.type === 'MERGE_VIDEO_AUDIO') {
       (async () => {
         try {
-          const { videoBuffer, audioBuffer, filename, mergeId, tabId } = message;
+          const { videoBuffer, audioBuffer, filename, mergeId, tabId, ctx } = message;
           chrome.runtime.sendMessage({
             type: 'AUDIO_PROGRESS',
             progress: 48,
             message: '正在初始化合并...',
           }).catch(() => {});
 
-          const result = await mergeVideoAudio(videoBuffer, audioBuffer, filename, mergeId, tabId);
+          const result = await mergeVideoAudio(videoBuffer, audioBuffer, filename, mergeId, tabId, ctx);
 
           sendResponse({ success: true, ext: result.ext });
         } catch (e) {
           console.error('[VC-Offscreen] 合并失败:', e);
-          sendResponse({ error: e.message });
+          // 透出 diagnostics 供 popup 渲染 Bug 报告
+          sendResponse({
+            error: e.message,
+            diagnostics: e.diagnostics || null,
+          });
         }
       })();
       return true;
@@ -490,7 +772,7 @@
     if (message.type === 'EXTRACT_AUDIO') {
       (async () => {
         try {
-          const { arrayBuffer, format, bitrate } = message;
+          const { arrayBuffer, format, bitrate, ctx } = message;
 
           if (!arrayBuffer || arrayBuffer.byteLength === 0) {
             sendResponse({ error: '无音频数据' });
@@ -515,7 +797,7 @@
               message: '正在实时提取音频（可能需要一些时间）...',
             }).catch(() => {});
 
-            audioBuffer = await captureAudioFromVideo(arrayBuffer);
+            audioBuffer = await captureAudioFromVideo(arrayBuffer, undefined, ctx);
           }
 
           // 编码
@@ -545,7 +827,10 @@
           sendResponse({ blob: blob });
         } catch (e) {
           console.error('[VC-Offscreen] 音频处理失败:', e);
-          sendResponse({ error: e.message });
+          sendResponse({
+            error: e.message,
+            diagnostics: e.diagnostics || null,
+          });
         }
       })();
       return true; // 保持通道

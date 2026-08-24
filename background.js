@@ -669,7 +669,7 @@ async function ensureOffscreenDocument() {
   return offscreenReadyPromise;
 }
 
-async function extractAudioViaOffscreen(arrayBuffer, format, bitrate) {
+async function extractAudioViaOffscreen(arrayBuffer, format, bitrate, ctx) {
   await ensureOffscreenDocument();
 
   const response = await chrome.runtime.sendMessage({
@@ -678,10 +678,14 @@ async function extractAudioViaOffscreen(arrayBuffer, format, bitrate) {
     arrayBuffer: arrayBuffer,
     format: format,     // 'mp3' | 'wav' | 'flac'
     bitrate: bitrate || 320,
+    ctx: ctx || null,
   });
 
   if (!response || response.error) {
-    throw new Error(response?.error || '音频提取失败');
+    const err = new Error(response?.error || '音频提取失败');
+    // 透出 offscreen 生成的诊断信息（codec 检测 / Bug 报告）
+    if (response && response.diagnostics) err.diagnostics = response.diagnostics;
+    throw err;
   }
 
   return response.blob;
@@ -693,6 +697,15 @@ async function downloadAudio(mediaItem, format, bitrate, tabId) {
   const title = sanitizeFilename(mediaItem.title);
   const mediaId = mediaItem.id;
   currentDownload = { tabId, mediaId };
+
+  // 诊断上下文（出错时透出供 popup 渲染 Bug 报告）
+  const state = getTabState(tabId);
+  const qOpt = mediaItem.qualityOptions?.[mediaItem.selectedQuality];
+  const ctx = {
+    pageUrl: state?.url || '',
+    videoUrl: qOpt?.url || mediaItem.url,
+    qualityLabel: qOpt?.label || '',
+  };
 
   try {
     if (mediaItem.type === 'dash-audio') {
@@ -722,11 +735,11 @@ async function downloadAudio(mediaItem, format, bitrate, tabId) {
         await downloadBlob(blob, `${title}.flac`);
       } else if (format === 'flac') {
         // 非 FLAC 源，转为 WAV 作为无损替代
-        const blob = await extractAudioViaOffscreen(arrayBuffer, 'wav', bitrate);
+        const blob = await extractAudioViaOffscreen(arrayBuffer, 'wav', bitrate, ctx);
         await downloadBlob(blob, `${title}.wav`);
       } else {
         // 转为 MP3 或 WAV
-        const blob = await extractAudioViaOffscreen(arrayBuffer, format, bitrate);
+        const blob = await extractAudioViaOffscreen(arrayBuffer, format, bitrate, ctx);
         const ext = format === 'wav' ? 'wav' : 'mp3';
         await downloadBlob(blob, `${title}.${ext}`);
       }
@@ -770,7 +783,7 @@ async function downloadAudio(mediaItem, format, bitrate, tabId) {
       }
 
       updateProgress(tabId, mediaId, 50, '正在提取并编码音频...');
-      const blob = await extractAudioViaOffscreen(arrayBuffer, format, bitrate);
+      const blob = await extractAudioViaOffscreen(arrayBuffer, format, bitrate, ctx);
       const ext = format === 'wav' ? 'wav' : format === 'flac' ? 'wav' : 'mp3';
       await downloadBlob(blob, `${title}.${ext}`);
 
@@ -979,6 +992,16 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         // 4. 发送到 offscreen 合并（offscreen 内部创建 blob URL、合并、并直接下载）
         await ensureOffscreenDocument();
 
+        // 组装诊断上下文（出错时 offscreen 会基于此生成 Bug 报告）
+        const ctx = {
+          pageUrl: state.url || tab.url || '',
+          videoUrl: vQ.url,
+          audioUrl: aQ.url,
+          videoSize: videoBuffer.byteLength,
+          audioSize: audioBuffer.byteLength,
+          qualityLabel: vQ.label || '',
+        };
+
         const response = await chrome.runtime.sendMessage({
           target: 'offscreen',
           type: 'MERGE_VIDEO_AUDIO',
@@ -987,6 +1010,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           filename: `${title}`,
           mergeId,
           tabId,
+          ctx,
         });
 
         // 释放原始 buffer 内存
@@ -994,7 +1018,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         audioBuffer = null;
 
         if (!response || response.error) {
-          throw new Error(response?.error || '合并失败');
+          const errMsg = response?.error || '合并失败';
+          const diag = response?.diagnostics || null;
+          console.error('[VC] 合并失败:', errMsg, diag);
+          // 透出 diagnostics 供 popup 渲染 Bug 报告
+          sendResponse({ error: errMsg, diagnostics: diag });
+          return;
         }
 
         // offscreen 已完成下载
@@ -1002,7 +1031,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         sendResponse({ success: true });
       } catch (e) {
         console.error('[VC] 合并下载失败:', e);
-        sendResponse({ error: e.message });
+        sendResponse({ error: e.message, diagnostics: e.diagnostics || null });
       }
     })();
     return true;
@@ -1046,7 +1075,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         sendResponse({ success: true });
       } catch (e) {
         console.error('[VC] 下载视频失败:', e);
-        sendResponse({ error: e.message });
+        sendResponse({ error: e.message, diagnostics: e.diagnostics || null });
       }
     })();
     return true;
@@ -1074,7 +1103,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         sendResponse({ success: true });
       } catch (e) {
         console.error('[VC] 下载音频失败:', e);
-        sendResponse({ error: e.message });
+        sendResponse({ error: e.message, diagnostics: e.diagnostics || null });
       }
     })();
     return true;
