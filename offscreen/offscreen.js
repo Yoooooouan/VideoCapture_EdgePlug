@@ -265,13 +265,17 @@
     return { mimeType: '', ext: 'webm' };
   }
 
-  function mergeVideoAudio(videoBlobUrl, audioBlobUrl, mergeId, tabId) {
+  function mergeVideoAudio(videoBuffer, audioBuffer, filename, mergeId, tabId) {
     return new Promise((resolve, reject) => {
       // 创建独立的 video 和 audio 元素（不复用 hidden-video，避免 createMediaElementSource 冲突）
       const videoEl = document.createElement('video');
       const audioEl = document.createElement('audio');
       videoEl.muted = true;     // 视频流不含音频，静音即可
       videoEl.playsInline = true;
+
+      // 在 offscreen 创建 blob URL（offscreen 是完整 DOM 环境，URL.createObjectURL 可用）
+      const videoBlobUrl = URL.createObjectURL(new Blob([videoBuffer], { type: 'video/mp4' }));
+      const audioBlobUrl = URL.createObjectURL(new Blob([audioBuffer], { type: 'audio/mp4' }));
 
       let audioCtx = null;
       let audioSource = null;
@@ -291,6 +295,8 @@
         try { if (audioCtx) audioCtx.close(); } catch (e) {}
         videoEl.src = '';
         audioEl.src = '';
+        try { URL.revokeObjectURL(videoBlobUrl); } catch (e) {}
+        try { URL.revokeObjectURL(audioBlobUrl); } catch (e) {}
       };
 
       const onLoadedMetadata = () => {
@@ -342,16 +348,31 @@
           recorder.ondataavailable = (e) => {
             if (e.data && e.data.size > 0) chunks.push(e.data);
           };
-          recorder.onstop = () => {
+          recorder.onstop = async () => {
             const mergedBlob = new Blob(chunks, { type: mime.mimeType || 'video/webm' });
             const mergedUrl = URL.createObjectURL(mergedBlob);
+            // 清理 video/audio 元素和输入 blob URL（mergedUrl 单独保留给下载用）
             cleanup();
             chrome.runtime.sendMessage({
               type: 'AUDIO_PROGRESS',
               progress: 97,
-              message: '合并完成，准备下载...',
+              message: '合并完成，正在保存...',
             }).catch(() => {});
-            resolve({ blobUrl: mergedUrl, ext: mime.ext });
+            // 直接在 offscreen 下载（offscreen 是完整 DOM，blob URL 可用；
+            // background Service Worker 没有 URL.createObjectURL，无法处理 blob 下载）
+            try {
+              await chrome.downloads.download({
+                url: mergedUrl,
+                filename: `${filename}.${mime.ext}`,
+                saveAs: false,
+              });
+              // 延迟释放，给下载管理器读取时间
+              setTimeout(() => { try { URL.revokeObjectURL(mergedUrl); } catch (e) {} }, 60000);
+              resolve({ success: true, ext: mime.ext });
+            } catch (e) {
+              try { URL.revokeObjectURL(mergedUrl); } catch (e2) {}
+              reject(new Error('下载失败: ' + e.message));
+            }
           };
           recorder.onerror = (e) => {
             cleanup();
@@ -422,18 +443,44 @@
     if (message.type === 'MERGE_VIDEO_AUDIO') {
       (async () => {
         try {
-          const { videoBlobUrl, audioBlobUrl, mergeId, tabId } = message;
+          const { videoBuffer, audioBuffer, filename, mergeId, tabId } = message;
           chrome.runtime.sendMessage({
             type: 'AUDIO_PROGRESS',
             progress: 48,
             message: '正在初始化合并...',
           }).catch(() => {});
 
-          const result = await mergeVideoAudio(videoBlobUrl, audioBlobUrl, mergeId, tabId);
+          const result = await mergeVideoAudio(videoBuffer, audioBuffer, filename, mergeId, tabId);
 
-          sendResponse({ blobUrl: result.blobUrl, ext: result.ext });
+          sendResponse({ success: true, ext: result.ext });
         } catch (e) {
           console.error('[VC-Offscreen] 合并失败:', e);
+          sendResponse({ error: e.message });
+        }
+      })();
+      return true;
+    }
+
+    // background Service Worker 没有 URL.createObjectURL，所有 Blob 下载都委托给 offscreen
+    if (message.type === 'DOWNLOAD_BLOB') {
+      (async () => {
+        try {
+          const { arrayBuffer, filename, mimeType } = message;
+          if (!arrayBuffer || arrayBuffer.byteLength === 0) {
+            sendResponse({ error: '无数据' });
+            return;
+          }
+          const blob = new Blob([arrayBuffer], { type: mimeType || 'application/octet-stream' });
+          const url = URL.createObjectURL(blob);
+          await chrome.downloads.download({
+            url: url,
+            filename: filename,
+            saveAs: false,
+          });
+          setTimeout(() => { try { URL.revokeObjectURL(url); } catch (e) {} }, 60000);
+          sendResponse({ success: true });
+        } catch (e) {
+          console.error('[VC-Offscreen] 下载失败:', e);
           sendResponse({ error: e.message });
         }
       })();

@@ -401,18 +401,20 @@ function concatArrayBuffers(buffers) {
   return result.buffer;
 }
 
+// 注意：MV3 Service Worker 中没有 URL.createObjectURL，
+// 因此所有 Blob → URL → chrome.downloads.download 的流程都要走 offscreen 文档。
 async function downloadBlob(blob, filename) {
-  try {
-    const url = URL.createObjectURL(blob);
-    await chrome.downloads.download({
-      url: url,
-      filename: filename,
-      saveAs: false,
-    });
-    setTimeout(() => URL.revokeObjectURL(url), 60000);
-  } catch (e) {
-    console.error('[VC] 下载失败:', e);
-    throw e;
+  await ensureOffscreenDocument();
+  const arrayBuffer = await blob.arrayBuffer();
+  const response = await chrome.runtime.sendMessage({
+    target: 'offscreen',
+    type: 'DOWNLOAD_BLOB',
+    arrayBuffer,
+    filename,
+    mimeType: blob.type || 'application/octet-stream',
+  });
+  if (!response || response.error) {
+    throw new Error(response?.error || '下载失败');
   }
 }
 
@@ -834,8 +836,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             state.playinfo = await getBilibiliPlayinfo(tab.id);
             if (state.playinfo) {
               const biliList = buildBilibiliMediaList(state.playinfo, state.title);
-              // 合并到媒体列表（替换同源 B站条目）
-              state.mediaList = state.mediaList.filter(m => m.source !== 'bilibili');
+              // 合并到媒体列表：移除所有 B 站相关条目
+              // 1) buildBilibiliMediaList 生成的旧条目（source='bilibili'）
+              // 2) 网络拦截到的 B 站 CDN m4s 流（source='network' + BILIBILI_CDN_RE）
+              //    每个清晰度 baseUrl+backupUrl 通常有 3 个 CDN 候选，不去重就会"每个分辨率3个视频"
+              state.mediaList = state.mediaList.filter(m => {
+                if (m.source === 'bilibili') return false;
+                if (m.source === 'network' && BILIBILI_CDN_RE.test(m.url)) return false;
+                return true;
+              });
               state.mediaList.unshift(...biliList);
               state.downloadProgress = null;
             }
@@ -929,47 +938,31 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           } else throw e;
         }
 
-        // 3. 创建 blob URL 传给 offscreen
+        // 3. 直接传 ArrayBuffer 给 offscreen（Service Worker 没有 URL.createObjectURL）
         updateProgress(tabId, mergeId, 40, '准备合并...');
-        const videoBlobUrl = URL.createObjectURL(new Blob([videoBuffer], { type: 'video/mp4' }));
-        const audioBlobUrl = URL.createObjectURL(new Blob([audioBuffer], { type: 'audio/mp4' }));
 
-        // 释放原始 buffer 内存
-        videoBuffer = null;
-        audioBuffer = null;
-
-        // 4. 发送到 offscreen 合并
+        // 4. 发送到 offscreen 合并（offscreen 内部创建 blob URL、合并、并直接下载）
         await ensureOffscreenDocument();
 
         const response = await chrome.runtime.sendMessage({
           target: 'offscreen',
           type: 'MERGE_VIDEO_AUDIO',
-          videoBlobUrl,
-          audioBlobUrl,
+          videoBuffer,
+          audioBuffer,
+          filename: `${title}`,
           mergeId,
           tabId,
         });
 
-        // 清理输入 blob URL
-        URL.revokeObjectURL(videoBlobUrl);
-        URL.revokeObjectURL(audioBlobUrl);
+        // 释放原始 buffer 内存
+        videoBuffer = null;
+        audioBuffer = null;
 
         if (!response || response.error) {
           throw new Error(response?.error || '合并失败');
         }
 
-        // 5. 下载合并后的文件
-        updateProgress(tabId, mergeId, 98, '正在保存合并文件...');
-        const ext = response.ext || 'webm';
-        await chrome.downloads.download({
-          url: response.blobUrl,
-          filename: `${title}.${ext}`,
-          saveAs: false,
-        });
-
-        // 延迟释放合并后的 blob URL（给下载管理器时间读取）
-        setTimeout(() => URL.revokeObjectURL(response.blobUrl), 60000);
-
+        // offscreen 已完成下载
         updateProgress(tabId, mergeId, 100, '视频+音频合并下载完成');
         sendResponse({ success: true });
       } catch (e) {
