@@ -244,22 +244,57 @@ function buildBilibiliMediaList(playinfo, title) {
   const list = [];
 
   // 视频流
+  // B站 playinfo 的 dash.video 同一清晰度(qn)会返回多个编码版本
+  // （H.264 avc1 / H.265 hev1 / AV1 av01）。Chrome 的 <video> 不解 HEVC/AV1，
+  // 直接默认选最高码率 → 选到 HEVC → "视频解码失败（格式不支持）"。
+  // 处理：同一 qn 只保留 1 路，优先 H.264；label 标注 codec；默认选第一个可解码的。
+  const codecRank = (codecs) => {
+    const c = (codecs || '').toLowerCase();
+    if (c.includes('avc1') || c.includes('avc3')) return 0; // H.264（Chrome 必解）
+    if (c.includes('hev1') || c.includes('hvc1')) return 1; // H.265（多数 Chrome 解不了）
+    if (c.includes('av01')) return 2;                       // AV1（部分 Chrome 解不了）
+    return 3;
+  };
+  const codecName = (codecs) => {
+    const r = codecRank(codecs);
+    return r === 0 ? 'H.264' : r === 1 ? 'H.265' : r === 2 ? 'AV1' : '未知';
+  };
+
   if (playinfo.video && playinfo.video.length > 0) {
-    const videoSorted = [...playinfo.video].sort((a, b) => (b.bandwidth || 0) - (a.bandwidth || 0));
+    // 1) 按 qn 分组
+    const byQn = new Map();
+    for (const v of playinfo.video) {
+      if (!byQn.has(v.id)) byQn.set(v.id, []);
+      byQn.get(v.id).push(v);
+    }
+    // 2) 同一 qn 优先保留 H.264
+    const deduped = [];
+    for (const group of byQn.values()) {
+      group.sort((a, b) => codecRank(a.codecs) - codecRank(b.codecs));
+      deduped.push(group[0]);
+    }
+    // 3) 按 qn 降序（高清晰度在前）
+    const videoSorted = deduped.sort((a, b) => b.id - a.id);
+
     const qualityOptions = videoSorted.map((v, i) => ({
-      label: BILIBILI_QUALITY_MAP[v.id] || `${v.height}p` || `流${i + 1}`,
+      label: `${BILIBILI_QUALITY_MAP[v.id] || `${v.height}p` || `流${i + 1}`} (${codecName(v.codecs)})`,
       bandwidth: v.bandwidth,
       url: v.baseUrl,
       backupUrl: v.backupUrl,
       codecs: v.codecs,
+      codecRank: codecRank(v.codecs),
       width: v.width,
       height: v.height,
       index: i,
     }));
 
+    // 4) 默认选第一个 H.264 的（Chrome 必解），没有则退回第 0 个
+    let defaultIdx = qualityOptions.findIndex(q => q.codecRank === 0);
+    if (defaultIdx < 0) defaultIdx = 0;
+
     list.push({
       id: `bili_video_${Date.now()}`,
-      url: videoSorted[0].baseUrl,
+      url: videoSorted[defaultIdx].baseUrl,
       type: 'dash-video',
       title: title || playinfo.title || 'B站视频',
       format: 'm4s',
@@ -268,7 +303,7 @@ function buildBilibiliMediaList(playinfo, title) {
       detectedAt: Date.now(),
       source: 'bilibili',
       qualityOptions: qualityOptions,
-      selectedQuality: 0,
+      selectedQuality: defaultIdx,
     });
   }
 
