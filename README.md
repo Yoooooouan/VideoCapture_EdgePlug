@@ -10,6 +10,7 @@
 | 📡 智能抓取 | `webRequest` 拦截 + `<video>` 元素检测 + B 站 `__playinfo__` 提取 |
 | 🔄 页面刷新 | 切换网页后自动清空，仅显示当前页面视频 |
 | 📺 清晰度选择 | HLS 主播放列表解析、B 站 playinfo 4K/1080P/720P... |
+| 🎭 视频+音频合并 | B 站 DASH 双流自动合并为带声音的完整视频（MediaRecorder 实时合成，无需 ffmpeg） |
 | 🎵 仅音频提取 | MP3（128/192/320 kbps）、WAV（无损 16-bit）、FLAC（无损，源为 FLAC 时直接保存） |
 | 👁 在线预览 | 弹窗内可对直接链接进行试播（blob/HLS 不支持预览） |
 | 💾 文件命名 | 自动用视频标题命名，清理非法字符，截断为 100 字符 |
@@ -79,9 +80,18 @@
 ### 2. B 站 DASH 视频下载
 - 通过 `chrome.scripting.executeScript({ world: 'MAIN' })` 访问页面 `window.__playinfo__`
 - 若无 `__playinfo__`，从 `window.__INITIAL_STATE__` 拿 bvid/cid，调用 B 站官方 `playurl` API（`fnval=80`）
-- 视频流和音频流分离开来
+- 视频流和音频流分离开来，弹窗合并为单张卡片，按优先级提供三种下载：
+  1. **下载视频+音频（合并）**：双流经 offscreen 文档 MediaRecorder 实时合成，输出带声音的完整视频（`.mp4`/`.webm`）
+  2. **仅视频（无声）**：下载纯视频 m4s 流
+  3. **仅音频**：从 m4s 音频流转码为 MP3/WAV
 - 通过 `declarativeNetRequest` 自动注入 `Referer: https://www.bilibili.com`，绕过 CDN 防盗链
-- 「下载视频」得到纯视频 `.mp4`（无音频），「下载音频」从 m4s 流中转码为 MP3/WAV
+
+### 2.1 视频+音频合并原理（offscreen）
+- 后台先分别下载视频/音频流为 ArrayBuffer，创建 blob URL 传给 offscreen 文档（避免消息通道传大文件）
+- offscreen 中用 `<video>` 播放视频流，`AudioContext` + `MediaElementSource` 路由音频流
+- `video.captureStream()`（或 canvas 回退）取视频轨 + 音频轨合成 `MediaStream`
+- `MediaRecorder` 实时录制为 MP4（Chrome 130+）或 WebM，视频码率 12Mbps
+- 合并耗时与视频时长相同（实时合成），进度条按播放进度显示
 
 ### 3. 音频提取与编码
 - **快速路径**：`AudioContext.decodeAudioData()` 解码 m4a/m4s/mp4 等容器
@@ -119,7 +129,8 @@ VideoCapture_EdgePlug/
 | --- | --- | --- |
 | 加密 HLS | 不支持 `#EXT-X-KEY` 加密的 HLS | 需要解密密钥流 |
 | FLAC 转码 | 源非 FLAC 时输出 WAV | 浏览器无原生 FLAC 编码器，WAV 同样无损 |
-| 视频+音频合并（B 站） | 需分别下载后用 ffmpeg 合并 | 无 ffmpeg.wasm 体积大；B 站 DASH 天然分轨 |
+| 合并为实时合成 | B 站视频+音频合并耗时≈视频时长 | MediaRecorder 实时录制；无损快速合并需 ffmpeg.wasm（体积过大未引入） |
+| 合并输出格式 | 优先 `.mp4`（Chrome 130+），否则 `.webm` | 取决于浏览器 MediaRecorder 编码器支持 |
 | HLS 在线预览 | 弹窗内不显示预览 | 需引入 hls.js 库；可下载后查看 |
 | Blob URL 抓取 | 不支持 blob:// 协议 | 跨上下文无法获取原始分片 |
 

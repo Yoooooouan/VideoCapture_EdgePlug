@@ -9,6 +9,12 @@
   // ==================== 状态 ====================
   let currentMediaList = [];
   let currentSite = 'general';
+  // B站合并卡片：audioMediaId → videoMediaId（卡片进度条/按钮挂在 videoMedia.id 上）
+  const combinedAnchor = new Map();
+
+  function resolveCardId(mediaId) {
+    return combinedAnchor.get(mediaId) || mediaId;
+  }
 
   // ==================== 初始化 ====================
   document.addEventListener('DOMContentLoaded', init);
@@ -95,6 +101,7 @@
   function renderMediaList(mediaList, downloadProgress, site) {
     const content = document.getElementById('content');
     content.innerHTML = '';
+    combinedAnchor.clear();
 
     // 刷新按钮
     const toolbar = document.createElement('div');
@@ -105,6 +112,27 @@
 
     // B站提示
     if (site === 'bilibili') {
+      const videoMedia = mediaList.find(m => m.type === 'dash-video');
+      const audioMedia = mediaList.find(m => m.type === 'dash-audio');
+      if (videoMedia && audioMedia) {
+        const note = document.createElement('div');
+        note.style.cssText = 'padding:8px 12px;background:#e8f5e9;border-radius:8px;font-size:11px;color:#2e7d32;margin-bottom:8px;line-height:1.5;';
+        note.innerHTML = '✅ B站已识别视频+音频双流。推荐使用<b>「下载视频+音频」</b>直接获取带声音的完整视频，无需手动合并。';
+        content.appendChild(note);
+
+        // 合并卡片（主入口）
+        const card = renderBilibiliCombinedCard(videoMedia, audioMedia, downloadProgress);
+        content.appendChild(card);
+
+        // 渲染其余媒体项（网络拦截到的其他流）
+        mediaList.filter(m => m !== videoMedia && m !== audioMedia).forEach((media) => {
+          const c = renderVideoCard(media, downloadProgress);
+          content.appendChild(c);
+        });
+        return;
+      }
+
+      // 只有单流时的提示
       const note = document.createElement('div');
       note.style.cssText = 'padding:8px 12px;background:#fff3cd;border-radius:8px;font-size:11px;color:#856404;margin-bottom:8px;line-height:1.5;';
       note.innerHTML = 'ℹ️ B站视频和音频为独立流。<b>视频文件不含音频</b>，如需完整视频请同时下载视频和音频并用工具合并。';
@@ -241,6 +269,158 @@
     return card;
   }
 
+  // ==================== B站合并卡片（视频+音频） ====================
+
+  function renderBilibiliCombinedCard(videoMedia, audioMedia, downloadProgress) {
+    const card = document.createElement('div');
+    card.className = 'video-card';
+    card.id = `card-${videoMedia.id}`;
+    card.style.border = '1px solid #a5d6a7';
+
+    // 登记 audioMediaId → videoMediaId 映射（进度与按钮联动）
+    combinedAnchor.set(audioMedia.id, videoMedia.id);
+
+    // --- 卡片头部 ---
+    const header = document.createElement('div');
+    header.className = 'card-header';
+    header.innerHTML = `
+      <div class="card-title">${escapeHtml(videoMedia.title)}</div>
+      <div class="card-meta">
+        <span class="badge badge-bilibili">B站</span>
+        ${videoMedia.duration > 0 ? `<span>⏱ ${formatDuration(videoMedia.duration)}</span>` : ''}
+        <span>视频+音频双流</span>
+      </div>`;
+    card.appendChild(header);
+
+    // --- 预览区域 ---
+    const preview = document.createElement('div');
+    preview.className = 'preview-area';
+    if (videoMedia.poster) {
+      preview.innerHTML = `<img src="${escapeHtml(videoMedia.poster)}" style="width:100%;max-height:180px;object-fit:cover;display:block;">`;
+    } else if (videoMedia.url.startsWith('http')) {
+      const v = document.createElement('video');
+      v.controls = true;
+      v.preload = 'metadata';
+      v.muted = true; // 视频流无声，静音避免误会
+      v.style.cssText = 'width:100%;max-height:180px;display:block;';
+      v.src = videoMedia.url;
+      preview.appendChild(v);
+    } else {
+      const ph = document.createElement('div');
+      ph.className = 'preview-placeholder';
+      ph.textContent = ' 预览不可用（纯视频流无声音）';
+      preview.appendChild(ph);
+    }
+    card.appendChild(preview);
+
+    // --- 选项区域 ---
+    const options = document.createElement('div');
+    options.className = 'options';
+
+    // 清晰度选择（视频）
+    if (videoMedia.qualityOptions && videoMedia.qualityOptions.length > 0) {
+      const row = document.createElement('div');
+      row.className = 'option-row';
+      row.innerHTML = `
+        <span class="option-label">清晰度:</span>
+        <select id="quality-${videoMedia.id}">
+          ${videoMedia.qualityOptions.map((q, i) =>
+            `<option value="${i}" ${i === (videoMedia.selectedQuality || 0) ? 'selected' : ''}>${escapeHtml(q.label)}</option>`
+          ).join('')}
+        </select>`;
+      options.appendChild(row);
+    }
+
+    // 音频格式选择（仅"下载音频"时生效，id 用 audioMedia.id 与 handleDownloadAudio 对齐）
+    const row2 = document.createElement('div');
+    row2.className = 'option-row';
+    row2.innerHTML = `
+      <span class="option-label">音频格式:</span>
+      <select id="audiofmt-${audioMedia.id}">
+        <option value="mp3-320">MP3 320kbps</option>
+        <option value="mp3-192">MP3 192kbps</option>
+        <option value="mp3-128">MP3 128kbps</option>
+        <option value="wav">WAV 无损</option>
+        <option value="flac">FLAC 无损</option>
+      </select>`;
+    options.appendChild(row2);
+
+    card.appendChild(options);
+
+    // --- 按钮区域：①合并 ②仅视频 ③仅音频 ---
+    const btnGroup = document.createElement('div');
+    btnGroup.className = 'btn-group';
+
+    // ① 下载视频+音频（合并，主推）
+    const mergeBtn = document.createElement('button');
+    mergeBtn.className = 'btn btn-merge';
+    mergeBtn.id = `dlmerge-${videoMedia.id}`;
+    mergeBtn.innerHTML = '🎬 下载视频+音频（推荐）';
+    mergeBtn.addEventListener('click', () => handleDownloadMerge(videoMedia, audioMedia));
+    btnGroup.appendChild(mergeBtn);
+
+    // ② 仅视频
+    const vBtn = document.createElement('button');
+    vBtn.className = 'btn btn-secondary';
+    vBtn.id = `dlvideo-${videoMedia.id}`;
+    vBtn.innerHTML = '⬇ 仅视频（无声）';
+    vBtn.addEventListener('click', () => handleDownloadVideo(videoMedia));
+    btnGroup.appendChild(vBtn);
+
+    // ③ 仅音频
+    const aBtn = document.createElement('button');
+    aBtn.className = 'btn btn-secondary';
+    aBtn.id = `dlaudio-${videoMedia.id}`;
+    aBtn.innerHTML = '🎵 仅音频';
+    aBtn.addEventListener('click', () => handleDownloadAudio(audioMedia));
+    btnGroup.appendChild(aBtn);
+
+    card.appendChild(btnGroup);
+
+    // --- 进度区域 ---
+    const prog = document.createElement('div');
+    prog.className = 'progress-section';
+    prog.id = `prog-${videoMedia.id}`;
+    prog.style.display = 'none';
+    prog.innerHTML = `
+      <div class="status-text" id="status-${videoMedia.id}"></div>
+      <div class="progress-bar"><div class="progress-fill" id="fill-${videoMedia.id}"></div></div>`;
+    card.appendChild(prog);
+
+    // 显示进行中的进度
+    if (downloadProgress && downloadProgress.id === videoMedia.id) {
+      showProgress(videoMedia.id, downloadProgress.progress, downloadProgress.message);
+    }
+
+    return card;
+  }
+
+  async function handleDownloadMerge(videoMedia, audioMedia) {
+    const qSelect = document.getElementById(`quality-${videoMedia.id}`);
+    const vIndex = qSelect ? parseInt(qSelect.value) : (videoMedia.selectedQuality || 0);
+
+    setButtonsDisabled(videoMedia.id, true);
+    showProgress(videoMedia.id, 0, '准备合并下载...');
+
+    try {
+      const resp = await chrome.runtime.sendMessage({
+        type: 'DOWNLOAD_MERGE',
+        videoMediaId: videoMedia.id,
+        audioMediaId: audioMedia.id,
+        videoQualityIndex: vIndex,
+        audioQualityIndex: 0, // 音频默认最高码率
+      });
+      if (resp && resp.error) {
+        showProgress(videoMedia.id, -1, '❌ ' + resp.error);
+        setButtonsDisabled(videoMedia.id, false);
+      }
+      // 成功则等待 DOWNLOAD_PROGRESS 消息
+    } catch (e) {
+      showProgress(videoMedia.id, -1, '❌ ' + e.message);
+      setButtonsDisabled(videoMedia.id, false);
+    }
+  }
+
   // ==================== 下载处理 ====================
   async function handleDownloadVideo(media) {
     const qSelect = document.getElementById(`quality-${media.id}`);
@@ -315,12 +495,13 @@
   }
 
   function showProgress(mediaId, progress, message) {
-    const progSection = document.getElementById(`prog-${mediaId}`);
+    const cardId = resolveCardId(mediaId);
+    const progSection = document.getElementById(`prog-${cardId}`);
     if (!progSection) return;
     progSection.style.display = 'block';
 
-    const status = document.getElementById(`status-${mediaId}`);
-    const fill = document.getElementById(`fill-${mediaId}`);
+    const status = document.getElementById(`status-${cardId}`);
+    const fill = document.getElementById(`fill-${cardId}`);
 
     if (status) status.textContent = message || '';
 
@@ -334,10 +515,13 @@
   }
 
   function setButtonsDisabled(mediaId, disabled) {
-    const vBtn = document.getElementById(`dlvideo-${mediaId}`);
-    const aBtn = document.getElementById(`dlaudio-${mediaId}`);
+    const cardId = resolveCardId(mediaId);
+    const vBtn = document.getElementById(`dlvideo-${cardId}`);
+    const aBtn = document.getElementById(`dlaudio-${cardId}`);
+    const mBtn = document.getElementById(`dlmerge-${cardId}`);
     if (vBtn) vBtn.disabled = disabled;
     if (aBtn) aBtn.disabled = disabled;
+    if (mBtn) mBtn.disabled = disabled;
   }
 
   // ==================== 辅助函数 ====================

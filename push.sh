@@ -11,7 +11,14 @@ cd "$(dirname "$0")"
 
 # 安全确认：本目录必须是独立 git 仓库
 TOPLEVEL="$(git rev-parse --show-toplevel)"
-if [ "$TOPLEVEL" != "$(pwd -P)" ]; then
+PWD_NOW="$(pwd -P)"
+# Windows/MSYS 路径格式归一化（/c/... vs C:/...）
+case "$(uname -s)" in
+  MINGW*|MSYS*|CYGWIN*)
+    PWD_NOW="$(cygpath -m "$PWD_NOW" 2>/dev/null || printf '%s' "$PWD_NOW")"
+    ;;
+esac
+if [ "$TOPLEVEL" != "$PWD_NOW" ]; then
   echo "❌ 当前 git 仓库根是: $TOPLEVEL"
   echo "   这不在项目目录内，可能为误用主目录仓库。已终止以防误推。"
   exit 1

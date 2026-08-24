@@ -248,10 +248,197 @@
     });
   }
 
+  // ==================== 视频+音频合并（MediaRecorder） ====================
+
+  function pickRecorderMime() {
+    const candidates = [
+      { mimeType: 'video/mp4;codecs=avc1,mp4a', ext: 'mp4' },
+      { mimeType: 'video/webm;codecs=vp9,opus', ext: 'webm' },
+      { mimeType: 'video/webm;codecs=vp8,opus', ext: 'webm' },
+      { mimeType: 'video/webm', ext: 'webm' },
+    ];
+    for (const c of candidates) {
+      try {
+        if (MediaRecorder.isTypeSupported(c.mimeType)) return c;
+      } catch (e) {}
+    }
+    return { mimeType: '', ext: 'webm' };
+  }
+
+  function mergeVideoAudio(videoBlobUrl, audioBlobUrl, mergeId, tabId) {
+    return new Promise((resolve, reject) => {
+      // 创建独立的 video 和 audio 元素（不复用 hidden-video，避免 createMediaElementSource 冲突）
+      const videoEl = document.createElement('video');
+      const audioEl = document.createElement('audio');
+      videoEl.muted = true;     // 视频流不含音频，静音即可
+      videoEl.playsInline = true;
+
+      let audioCtx = null;
+      let audioSource = null;
+      let audioDest = null;
+      let recorder = null;
+      let canvas = null;
+      let rafId = null;
+      const chunks = [];
+      let started = false;
+      let progressTimer = null;
+
+      const cleanup = () => {
+        if (rafId) cancelAnimationFrame(rafId);
+        if (progressTimer) clearInterval(progressTimer);
+        try { if (audioSource) audioSource.disconnect(); } catch (e) {}
+        try { if (audioDest) audioDest.disconnect(); } catch (e) {}
+        try { if (audioCtx) audioCtx.close(); } catch (e) {}
+        videoEl.src = '';
+        audioEl.src = '';
+      };
+
+      const onLoadedMetadata = () => {
+        if (started) return;
+        started = true;
+
+        try {
+          // ---- 获取视频轨道 ----
+          // 优先使用 video.captureStream()，不可用或无轨道时回退到 canvas
+          let videoTrack = null;
+          if (videoEl.captureStream) {
+            try {
+              const vs = videoEl.captureStream();
+              videoTrack = vs.getVideoTracks()[0] || null;
+            } catch (e) {}
+          }
+          if (!videoTrack) {
+            // canvas 回退方案
+            canvas = document.createElement('canvas');
+            canvas.width = videoEl.videoWidth || 1280;
+            canvas.height = videoEl.videoHeight || 720;
+            const ctx = canvas.getContext('2d');
+            const draw = () => {
+              try { ctx.drawImage(videoEl, 0, 0, canvas.width, canvas.height); } catch (e) {}
+              rafId = requestAnimationFrame(draw);
+            };
+            draw();
+            const cs = canvas.captureStream(60);
+            videoTrack = cs.getVideoTracks()[0];
+          }
+
+          // ---- 获取音频轨道 ----
+          audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+          audioSource = audioCtx.createMediaElementSource(audioEl);
+          audioDest = audioCtx.createMediaStreamDestination();
+          audioSource.connect(audioDest);
+
+          // ---- 合并流 ----
+          const combined = new MediaStream();
+          combined.addTrack(videoTrack);
+          audioDest.stream.getAudioTracks().forEach(t => combined.addTrack(t));
+
+          // ---- 选择编码器 ----
+          const mime = pickRecorderMime();
+          const recorderOpts = { videoBitsPerSecond: 12_000_000, audioBitsPerSecond: 192_000 };
+          if (mime.mimeType) recorderOpts.mimeType = mime.mimeType;
+
+          recorder = new MediaRecorder(combined, recorderOpts);
+          recorder.ondataavailable = (e) => {
+            if (e.data && e.data.size > 0) chunks.push(e.data);
+          };
+          recorder.onstop = () => {
+            const mergedBlob = new Blob(chunks, { type: mime.mimeType || 'video/webm' });
+            const mergedUrl = URL.createObjectURL(mergedBlob);
+            cleanup();
+            chrome.runtime.sendMessage({
+              type: 'AUDIO_PROGRESS',
+              progress: 97,
+              message: '合并完成，准备下载...',
+            }).catch(() => {});
+            resolve({ blobUrl: mergedUrl, ext: mime.ext });
+          };
+          recorder.onerror = (e) => {
+            cleanup();
+            reject(new Error('录制失败: ' + (e.error?.message || 'unknown')));
+          };
+
+          recorder.start(1000);
+
+          // ---- 播放 ----
+          videoEl.play().catch((e) => {
+            cleanup();
+            reject(new Error('视频播放失败: ' + e.message));
+          });
+          audioEl.play().catch(() => {
+            if (audioCtx.state === 'suspended') audioCtx.resume().catch(() => {});
+          });
+
+          // ---- 进度报告 ----
+          const dur = videoEl.duration || 0;
+          progressTimer = setInterval(() => {
+            if (videoEl.ended) {
+              clearInterval(progressTimer);
+              progressTimer = null;
+              if (recorder.state !== 'inactive') recorder.stop();
+              return;
+            }
+            const pct = dur > 0 ? 50 + (videoEl.currentTime / dur) * 45 : 50;
+            const displayPct = dur > 0 ? Math.round((videoEl.currentTime / dur) * 100) : 0;
+            chrome.runtime.sendMessage({
+              type: 'AUDIO_PROGRESS',
+              progress: pct,
+              message: `正在合并视频+音频... ${displayPct}%`,
+            }).catch(() => {});
+          }, 500);
+
+        } catch (e) {
+          cleanup();
+          reject(new Error('合并初始化失败: ' + e.message));
+        }
+      };
+
+      const onError = () => {
+        cleanup();
+        reject(new Error('视频解码失败（格式不支持）'));
+      };
+
+      videoEl.addEventListener('loadedmetadata', onLoadedMetadata, { once: true });
+      videoEl.addEventListener('error', onError, { once: true });
+
+      // 超时保护（30 分钟）
+      setTimeout(() => {
+        if (!started) {
+          cleanup();
+          reject(new Error('超时：无法加载视频'));
+        }
+      }, 30 * 60 * 1000);
+
+      videoEl.src = videoBlobUrl;
+      audioEl.src = audioBlobUrl;
+    });
+  }
+
   // ==================== 消息处理 ====================
 
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message.target !== 'offscreen') return;
+
+    if (message.type === 'MERGE_VIDEO_AUDIO') {
+      (async () => {
+        try {
+          const { videoBlobUrl, audioBlobUrl, mergeId, tabId } = message;
+          chrome.runtime.sendMessage({
+            type: 'AUDIO_PROGRESS',
+            progress: 48,
+            message: '正在初始化合并...',
+          }).catch(() => {});
+
+          const result = await mergeVideoAudio(videoBlobUrl, audioBlobUrl, mergeId, tabId);
+
+          sendResponse({ blobUrl: result.blobUrl, ext: result.ext });
+        } catch (e) {
+          console.error('[VC-Offscreen] 合并失败:', e);
+          sendResponse({ error: e.message });
+        }
+      })();
+      return true;
+    }
 
     if (message.type === 'EXTRACT_AUDIO') {
       (async () => {

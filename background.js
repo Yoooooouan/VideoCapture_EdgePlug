@@ -877,6 +877,109 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true; // 保持消息通道
   }
 
+  if (message.type === 'DOWNLOAD_MERGE') {
+    (async () => {
+      const { videoMediaId, audioMediaId, videoQualityIndex, audioQualityIndex, tabId: msgTabId } = message;
+      try {
+        const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+        const tabId = tab?.id || msgTabId;
+        const state = getTabState(tabId);
+
+        const videoMedia = state.mediaList.find(m => m.id === videoMediaId);
+        const audioMedia = state.mediaList.find(m => m.id === audioMediaId);
+
+        if (!videoMedia || !audioMedia) {
+          sendResponse({ error: '未找到视频或音频流' });
+          return;
+        }
+
+        const title = sanitizeFilename(videoMedia.title);
+        const mergeId = videoMedia.id; // 用视频流 id 作为进度标识，popup 可定位到合并卡片
+        currentDownload = { tabId, mediaId: mergeId };
+
+        // 1. 下载视频流
+        updateProgress(tabId, mergeId, 0, '下载视频流...');
+        const vQ = videoMedia.qualityOptions[videoQualityIndex || 0] || videoMedia.qualityOptions[0];
+        let videoBuffer;
+        try {
+          const vResp = await fetch(vQ.url);
+          if (!vResp.ok) throw new Error(`HTTP ${vResp.status}`);
+          videoBuffer = await vResp.arrayBuffer();
+        } catch (e) {
+          if (vQ.backupUrl) {
+            const vResp = await fetch(vQ.backupUrl);
+            if (!vResp.ok) throw new Error(`视频流 HTTP ${vResp.status}`);
+            videoBuffer = await vResp.arrayBuffer();
+          } else throw e;
+        }
+
+        // 2. 下载音频流
+        updateProgress(tabId, mergeId, 25, '下载音频流...');
+        const aQ = audioMedia.qualityOptions[audioQualityIndex || 0] || audioMedia.qualityOptions[0];
+        let audioBuffer;
+        try {
+          const aResp = await fetch(aQ.url);
+          if (!aResp.ok) throw new Error(`HTTP ${aResp.status}`);
+          audioBuffer = await aResp.arrayBuffer();
+        } catch (e) {
+          if (aQ.backupUrl) {
+            const aResp = await fetch(aQ.backupUrl);
+            if (!aResp.ok) throw new Error(`音频流 HTTP ${aResp.status}`);
+            audioBuffer = await aResp.arrayBuffer();
+          } else throw e;
+        }
+
+        // 3. 创建 blob URL 传给 offscreen
+        updateProgress(tabId, mergeId, 40, '准备合并...');
+        const videoBlobUrl = URL.createObjectURL(new Blob([videoBuffer], { type: 'video/mp4' }));
+        const audioBlobUrl = URL.createObjectURL(new Blob([audioBuffer], { type: 'audio/mp4' }));
+
+        // 释放原始 buffer 内存
+        videoBuffer = null;
+        audioBuffer = null;
+
+        // 4. 发送到 offscreen 合并
+        await ensureOffscreenDocument();
+
+        const response = await chrome.runtime.sendMessage({
+          target: 'offscreen',
+          type: 'MERGE_VIDEO_AUDIO',
+          videoBlobUrl,
+          audioBlobUrl,
+          mergeId,
+          tabId,
+        });
+
+        // 清理输入 blob URL
+        URL.revokeObjectURL(videoBlobUrl);
+        URL.revokeObjectURL(audioBlobUrl);
+
+        if (!response || response.error) {
+          throw new Error(response?.error || '合并失败');
+        }
+
+        // 5. 下载合并后的文件
+        updateProgress(tabId, mergeId, 98, '正在保存合并文件...');
+        const ext = response.ext || 'webm';
+        await chrome.downloads.download({
+          url: response.blobUrl,
+          filename: `${title}.${ext}`,
+          saveAs: false,
+        });
+
+        // 延迟释放合并后的 blob URL（给下载管理器时间读取）
+        setTimeout(() => URL.revokeObjectURL(response.blobUrl), 60000);
+
+        updateProgress(tabId, mergeId, 100, '视频+音频合并下载完成');
+        sendResponse({ success: true });
+      } catch (e) {
+        console.error('[VC] 合并下载失败:', e);
+        sendResponse({ error: e.message });
+      }
+    })();
+    return true;
+  }
+
   if (message.type === 'DOWNLOAD_VIDEO') {
     (async () => {
       const { mediaId, qualityIndex, tabId: msgTabId } = message;

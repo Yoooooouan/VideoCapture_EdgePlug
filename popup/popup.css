@@ -238,6 +238,16 @@ select:focus {
   color: #fff;
 }
 
+.btn-merge {
+  background: linear-gradient(135deg, #34a853, #2e7d32);
+  color: #fff;
+}
+
+.btn-merge:hover:not(:disabled) {
+  filter: brightness(1.1);
+  box-shadow: 0 2px 8px rgba(52,168,83,0.4);
+}
+
 .btn-primary:hover {
   filter: brightness(1.1);
   box-shadow: 0 2px 8px rgba(74,144,217,0.4);
