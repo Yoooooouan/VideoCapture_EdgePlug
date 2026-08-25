@@ -879,6 +879,24 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
 
+  // offscreen 无 chrome.downloads API：把 blob URL 交回 SW 执行下载
+  // blob URL 在扩展 origin 内全局有效，SW 调 downloads.download 可读取 offscreen 创建的 blob
+  if (message.type === 'SAVE_BLOB_DOWNLOAD') {
+    (async () => {
+      try {
+        const downloadId = await chrome.downloads.download({
+          url: message.url,
+          filename: message.filename,
+          saveAs: false,
+        });
+        sendResponse({ ok: true, downloadId });
+      } catch (e) {
+        sendResponse({ error: e.message || String(e) });
+      }
+    })();
+    return true;
+  }
+
   // ==================== 下载大小预估 ====================
   if (message.type === 'ESTIMATE_SIZE') {
     (async () => {

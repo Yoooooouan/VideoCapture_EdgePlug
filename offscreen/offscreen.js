@@ -1191,17 +1191,24 @@
     };
   }
 
-  // blob → chrome.downloads（offscreen 专属能力：SW 没有 URL.createObjectURL）
+  // blob → 委托 SW 执行 chrome.downloads
+  // （offscreen 文档有 DOM 可创建 blob URL，但没有 chrome.downloads API；
+  //   blob URL 在扩展 origin 内全局有效，SW 调 chrome.downloads.download 可读取该 blob）
   async function saveBlob(blob, filename) {
     const url = URL.createObjectURL(blob);
     try {
-      await chrome.downloads.download({ url, filename, saveAs: false });
+      const resp = await chrome.runtime.sendMessage({
+        target: 'background',
+        type: 'SAVE_BLOB_DOWNLOAD',
+        url, filename,
+      });
+      if (!resp || resp.error) throw new Error((resp && resp.error) || 'SW 下载失败');
     } catch (e) {
       try { URL.revokeObjectURL(url); } catch (e2) {}
-      throw new Error('下载失败: ' + e.message);
+      throw new Error('下载失败: ' + (e.message || e));
     }
-    // 延迟释放，给下载管理器读取时间
-    setTimeout(() => { try { URL.revokeObjectURL(url); } catch (e) {} }, 60000);
+    // 延迟释放，给下载管理器读取时间（大文件覆盖 5 分钟）
+    setTimeout(() => { try { URL.revokeObjectURL(url); } catch (e) {} }, 5 * 60 * 1000);
   }
 
   // ---------- 任务执行器 ----------
