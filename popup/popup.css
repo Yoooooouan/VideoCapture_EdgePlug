@@ -318,6 +318,112 @@ select:focus {
   width: 0%;
 }
 
+/* ===== Background Download Tasks ===== */
+.tasks {
+  padding: 10px 12px 0;
+}
+
+.tasks-head {
+  font-size: 11px;
+  font-weight: 600;
+  color: #357abd;
+  padding: 6px 10px;
+  background: #e8f1fb;
+  border-radius: 6px;
+  margin-bottom: 6px;
+}
+
+.task-item {
+  background: #fff;
+  border-radius: 8px;
+  padding: 8px 10px;
+  margin-bottom: 6px;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.06);
+}
+
+.task-top {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.task-icon {
+  flex-shrink: 0;
+  font-size: 13px;
+}
+
+.task-title {
+  flex: 1;
+  font-size: 12px;
+  font-weight: 600;
+  color: #333;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.btn-task-cancel,
+.btn-task-dismiss,
+.btn-task-diag {
+  flex: none;
+  padding: 4px 10px;
+  font-size: 11px;
+  border-radius: 6px;
+  border: none;
+  cursor: pointer;
+  font-weight: 600;
+}
+
+.btn-task-cancel {
+  background: #fdecea;
+  color: #c0392b;
+}
+
+.btn-task-cancel:hover {
+  background: #fadbd8;
+}
+
+/* 两段式确认：第一次点击后进入待确认状态 */
+.btn-task-cancel.armed {
+  background: #c0392b;
+  color: #fff;
+}
+
+.btn-task-cancel.armed:hover {
+  background: #a93226;
+}
+
+.btn-task-cancel:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.btn-task-dismiss {
+  background: #f0f2f5;
+  color: #666;
+  border: 1px solid #ddd;
+}
+
+.btn-task-dismiss:hover {
+  background: #e4e7ea;
+}
+
+.btn-task-diag {
+  margin-top: 6px;
+  width: 100%;
+  background: #fff8e1;
+  color: #e65100;
+  border: 1px solid #ffca28;
+}
+
+.btn-task-diag:hover {
+  background: #fff3cd;
+}
+
+.task-item.task-done .status-text { color: #2e7d32; }
+.task-item.task-error .status-text { color: #c0392b; }
+.task-item.task-cancelled .status-text { color: #999; }
+
 /* ===== Scrollbar ===== */
 ::-webkit-scrollbar {
   width: 6px;

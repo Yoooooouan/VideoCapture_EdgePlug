@@ -1,9 +1,10 @@
 /**
  * offscreen/offscreen.js
- * 离屏文档：音频提取与编码
- * 1. 尝试 decodeAudioData 快速解码（非实时）
- * 2. 失败时使用 video 元素 + AudioContext 实时提取
- * 3. 编码为 MP3 (lamejs) 或 WAV (原生)
+ * 离屏文档：后台下载引擎 + 音频提取与编码
+ * 1. 后台下载任务常驻本文档执行（popup 关闭 / Service Worker 被闲置回收均不影响）
+ * 2. 只有用户在 popup 中明确确认取消（CANCEL_DOWNLOAD）才会中止任务
+ * 3. 音频提取：decodeAudioData 快速解码，失败时 video 元素实时提取
+ * 4. 编码为 MP3 (lamejs) 或 WAV (原生)
  */
 
 (function () {
@@ -402,7 +403,7 @@
 
   // ==================== 实时音频提取（video 元素） ====================
 
-  function captureAudioFromVideo(arrayBuffer, mimeType, ctx) {
+  function captureAudioFromVideo(arrayBuffer, mimeType, ctx, signal) {
     return new Promise((resolve, reject) => {
       const blob = new Blob([arrayBuffer], { type: mimeType || 'video/mp4' });
       const blobUrl = URL.createObjectURL(blob);
@@ -514,6 +515,15 @@
       video.addEventListener('ended', onEnded, { once: true });
       video.addEventListener('error', onError, { once: true });
 
+      // 用户确认取消：中止实时提取
+      if (signal) {
+        signal.addEventListener('abort', () => {
+          try { video.pause(); } catch (e) {}
+          cleanup();
+          reject(new DOMException('The operation was aborted.', 'AbortError'));
+        }, { once: true });
+      }
+
       // 超时保护（30分钟）
       setTimeout(() => {
         if (!started) {
@@ -615,7 +625,7 @@
     return frags;
   }
 
-  async function fastRemuxMP4(videoBuffer, audioBuffer, filename, ctx) {
+  async function fastRemuxMP4(videoBuffer, audioBuffer, ctx, report) {
     const vu = new Uint8Array(videoBuffer);
     const au = new Uint8Array(audioBuffer);
 
@@ -678,9 +688,7 @@
     for (const f of vFrags) total += f.moof.size + f.mdat.size;
     for (const f of aFrags) total += f.moof.size + f.mdat.size;
 
-    chrome.runtime.sendMessage({
-      type: 'AUDIO_PROGRESS', progress: 60, message: '正在合并音视频轨道（无重编码）...',
-    }).catch(() => {});
+    report(60, '正在合并音视频轨道（无重编码）...');
 
     const out = new Uint8Array(total);
     const dv = new DataView(out.buffer);
@@ -738,9 +746,7 @@
     out.set([0, 0, 0, 0x10, 0x73, 0x74, 0x79, 0x70, 0x6d, 0x73, 0x64, 0x68, 0, 0, 0, 0], w);
     w += STYP_LEN;
 
-    chrome.runtime.sendMessage({
-      type: 'AUDIO_PROGRESS', progress: 80, message: '正在写入媒体分片...',
-    }).catch(() => {});
+    report(80, '正在写入媒体分片...');
 
     // 4) 分片：先视频后音频。每个 moof 紧跟其 mdat，trun data_offset 相对 moof 起点仍有效。
     const emitFrags = (u8, frags, fromTid, toTid) => {
@@ -763,28 +769,15 @@
       const hasHEVC = codecs.some(c => /hev1|hvc1/i.test(c));
       const hasAV1 = codecs.some(c => /av01/i.test(c));
       if (hasHEVC || hasAV1) {
-        chrome.runtime.sendMessage({
-          type: 'AUDIO_PROGRESS', progress: 92,
-          message: '提示：视频为 ' + (hasHEVC ? 'HEVC' : 'AV1') + '，已无损合并，Chrome 或无法播放但文件有效',
-        }).catch(() => {});
+        report(92, '提示：视频为 ' + (hasHEVC ? 'HEVC' : 'AV1') + '，已无损合并，Chrome 或无法播放但文件有效');
       }
     } catch (e) {}
 
-    // 5) 下载
-    chrome.runtime.sendMessage({
-      type: 'AUDIO_PROGRESS', progress: 95, message: '合并完成，正在保存...',
-    }).catch(() => {});
+    // 5) 返回 blob（保存统一由任务执行器完成）
+    report(95, '合并完成...');
 
     const blob = new Blob([out], { type: 'video/mp4' });
-    const url = URL.createObjectURL(blob);
-    try {
-      await chrome.downloads.download({ url, filename: `${filename}.mp4`, saveAs: false });
-      setTimeout(() => { try { URL.revokeObjectURL(url); } catch (e) {} }, 60000);
-    } catch (e) {
-      try { URL.revokeObjectURL(url); } catch (e2) {}
-      throw new Error('下载失败: ' + e.message);
-    }
-    return { success: true, ext: 'mp4' };
+    return { blob, ext: 'mp4' };
   }
 
   // ==================== 视频+音频合并（MediaRecorder 实时录制兜底） ====================
@@ -804,7 +797,7 @@
     return { mimeType: '', ext: 'webm' };
   }
 
-  function mergeVideoAudio(videoBuffer, audioBuffer, filename, mergeId, tabId, ctx) {
+  function mergeVideoAudio(videoBuffer, audioBuffer, ctx, report, signal) {
     return new Promise((resolve, reject) => {
       // 创建独立的 video 和 audio 元素（不复用 hidden-video，避免 createMediaElementSource 冲突）
       const videoEl = document.createElement('video');
@@ -825,6 +818,7 @@
       const chunks = [];
       let started = false;
       let progressTimer = null;
+      let aborted = false;
 
       const cleanup = () => {
         if (rafId) cancelAnimationFrame(rafId);
@@ -887,31 +881,12 @@
           recorder.ondataavailable = (e) => {
             if (e.data && e.data.size > 0) chunks.push(e.data);
           };
-          recorder.onstop = async () => {
+          recorder.onstop = () => {
+            if (aborted) return; // 已被用户取消，结果丢弃
             const mergedBlob = new Blob(chunks, { type: mime.mimeType || 'video/webm' });
-            const mergedUrl = URL.createObjectURL(mergedBlob);
-            // 清理 video/audio 元素和输入 blob URL（mergedUrl 单独保留给下载用）
             cleanup();
-            chrome.runtime.sendMessage({
-              type: 'AUDIO_PROGRESS',
-              progress: 97,
-              message: '合并完成，正在保存...',
-            }).catch(() => {});
-            // 直接在 offscreen 下载（offscreen 是完整 DOM，blob URL 可用；
-            // background Service Worker 没有 URL.createObjectURL，无法处理 blob 下载）
-            try {
-              await chrome.downloads.download({
-                url: mergedUrl,
-                filename: `${filename}.${mime.ext}`,
-                saveAs: false,
-              });
-              // 延迟释放，给下载管理器读取时间
-              setTimeout(() => { try { URL.revokeObjectURL(mergedUrl); } catch (e) {} }, 60000);
-              resolve({ success: true, ext: mime.ext });
-            } catch (e) {
-              try { URL.revokeObjectURL(mergedUrl); } catch (e2) {}
-              reject(new Error('下载失败: ' + e.message));
-            }
+            report(97, '合并完成，正在保存...');
+            resolve({ blob: mergedBlob, ext: mime.ext });
           };
           recorder.onerror = (e) => {
             cleanup();
@@ -940,11 +915,7 @@
             }
             const pct = dur > 0 ? 50 + (videoEl.currentTime / dur) * 45 : 50;
             const displayPct = dur > 0 ? Math.round((videoEl.currentTime / dur) * 100) : 0;
-            chrome.runtime.sendMessage({
-              type: 'AUDIO_PROGRESS',
-              progress: pct,
-              message: `正在合并视频+音频... ${displayPct}%`,
-            }).catch(() => {});
+            report(pct, `正在合并视频+音频... ${displayPct}%`);
           }, 500);
 
         } catch (e) {
@@ -963,6 +934,16 @@
       videoEl.addEventListener('loadedmetadata', onLoadedMetadata, { once: true });
       videoEl.addEventListener('error', onError, { once: true });
 
+      // 用户确认取消：停止录制并清理
+      if (signal) {
+        signal.addEventListener('abort', () => {
+          aborted = true;
+          try { if (recorder && recorder.state !== 'inactive') recorder.stop(); } catch (e) {}
+          cleanup();
+          reject(new DOMException('The operation was aborted.', 'AbortError'));
+        }, { once: true });
+      }
+
       // 超时保护（30 分钟）
       setTimeout(() => {
         if (!started) {
@@ -976,145 +957,502 @@
     });
   }
 
+  // ==================== 后台下载任务管理器 ====================
+  // 下载任务常驻 offscreen 文档执行：
+  // - popup 关闭（误触点击页面其他地方）不影响任务，重新打开可恢复进度显示
+  // - Service Worker 被闲置回收也不影响（下载引擎不依赖 SW 存活）
+  // - 只有用户在 popup 中确认取消（CANCEL_DOWNLOAD）才会中止
+
+  const downloadTasks = new Map(); // taskId → task
+  const TASK_TTL_MS = 30 * 60 * 1000;        // 已结束任务保留 30 分钟供回看
+  const OFFSCREEN_IDLE_MS = 10 * 60 * 1000;  // 无任务 10 分钟后自动关闭离屏文档
+  let lastActivityAt = Date.now();
+
+  function serializeTask(task) {
+    return {
+      taskId: task.id,
+      mode: task.mode,          // 'video' | 'audio' | 'merge'
+      kind: task.kind,          // 'hls' | 'm4s' | 'direct' | 'audio' | 'merge'
+      mediaId: task.mediaId,
+      title: task.title,
+      filename: task.filename,
+      status: task.status,      // 'running' | 'done' | 'error' | 'cancelled'
+      progress: Math.round(task.progress),
+      message: task.message,
+      error: task.error || null,
+      diagnostics: task.diagnostics || null,
+      startedAt: task.startedAt,
+      endedAt: task.endedAt || null,
+    };
+  }
+
+  // 节流广播：每 250ms 最多一条（popup 与 background 均可收到）
+  const broadcastTimers = new Map();
+  function broadcastTask(task, force) {
+    const now = Date.now();
+    if (!force && now - (broadcastTimers.get(task.id) || 0) < 250) return;
+    broadcastTimers.set(task.id, now);
+    chrome.runtime.sendMessage({
+      type: 'DOWNLOAD_PROGRESS',
+      ...serializeTask(task),
+    }).catch(() => {});
+  }
+
+  function abortError() {
+    return new DOMException('The operation was aborted.', 'AbortError');
+  }
+
+  function startTask(spec) {
+    if (!spec || !spec.id) throw new Error('任务参数无效');
+    if (downloadTasks.has(spec.id)) return spec.id;
+    const task = {
+      ...spec,
+      status: 'running',
+      progress: 0,
+      message: '排队中...',
+      error: null,
+      diagnostics: null,
+      startedAt: Date.now(),
+      endedAt: null,
+      abort: new AbortController(),
+    };
+    downloadTasks.set(task.id, task);
+    lastActivityAt = Date.now();
+    broadcastTask(task, true);
+
+    runTask(task); // 异步执行，不阻塞 ack
+    return task.id;
+  }
+
+  function cancelTask(taskId) {
+    const task = downloadTasks.get(taskId);
+    if (!task || task.status !== 'running') return false;
+    task.abort.abort();
+    return true; // 状态由 runTask 的 catch 收尾并广播
+  }
+
+  async function runTask(task) {
+    const onProgress = (progress, message) => {
+      task.progress = progress;
+      task.message = message;
+      lastActivityAt = Date.now();
+      broadcastTask(task);
+    };
+    try {
+      if (task.kind === 'hls') await runHlsTask(task, onProgress);
+      else if (task.kind === 'm4s') await runM4sTask(task, onProgress);
+      else if (task.kind === 'direct') await runDirectTask(task, onProgress);
+      else if (task.kind === 'audio') await runAudioTask(task, onProgress);
+      else if (task.kind === 'merge') await runMergeTask(task, onProgress);
+      else throw new Error(`未知任务类型: ${task.kind}`);
+
+      if (task.abort.signal.aborted) throw abortError();
+      task.status = 'done';
+      task.progress = 100;
+      task.message = '下载完成 ✅';
+    } catch (e) {
+      if (task.abort.signal.aborted || e.name === 'AbortError') {
+        task.status = 'cancelled';
+        task.message = '已取消（用户确认）';
+      } else {
+        task.status = 'error';
+        task.error = e.message;
+        task.diagnostics = e.diagnostics || null;
+        task.message = '错误: ' + e.message;
+        console.error('[VC-Offscreen] 后台下载失败:', task.kind, e);
+      }
+    } finally {
+      task.endedAt = Date.now();
+      broadcastTimers.delete(task.id);
+      broadcastTask(task, true);
+    }
+  }
+
+  // 已结束任务到期清理；长期无任务自动关闭离屏文档节省内存
+  setInterval(async () => {
+    const now = Date.now();
+    for (const [id, t] of downloadTasks) {
+      if (t.status !== 'running' && t.endedAt && now - t.endedAt > TASK_TTL_MS) {
+        downloadTasks.delete(id);
+      }
+    }
+    const hasRunning = [...downloadTasks.values()].some(t => t.status === 'running');
+    if (!hasRunning && now - lastActivityAt > OFFSCREEN_IDLE_MS) {
+      // 无任务闲置：优先自己关，失败则请 Service Worker 代关
+      let closed = false;
+      try { await chrome.offscreen.closeDocument(); closed = true; } catch (e) {}
+      if (!closed) {
+        chrome.runtime.sendMessage({ type: 'OFFSCREEN_IDLE_CLOSE' }).catch(() => {});
+      }
+    }
+  }, 60 * 1000);
+
+  // ---------- 下载工具（自 background.js 迁移，增加 signal 取消） ----------
+
+  function resolveUrl(url, baseUrl) {
+    try {
+      if (url.startsWith('http://') || url.startsWith('https://')) return url;
+      if (url.startsWith('//')) return 'https:' + url;
+      return new URL(url, baseUrl).href;
+    } catch {
+      return url;
+    }
+  }
+
+  function parseAttributes(str) {
+    const attrs = {};
+    const re = /([A-Z0-9-]+)=("[^"]*"|[^,]*)/g;
+    let m;
+    while ((m = re.exec(str)) !== null) {
+      attrs[m[1]] = m[2].replace(/^"|"$/g, '');
+    }
+    return attrs;
+  }
+
+  function parseM3U8(content, baseUrl) {
+    const lines = content.split('\n').map(l => l.trim()).filter(l => l.length > 0);
+    const variants = [];
+    const segments = [];
+    let isMaster = false;
+    let initSegmentUrl = null;
+    let currentVariant = null;
+    let keyInfo = null;
+
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+
+      if (line.startsWith('#EXT-X-STREAM-INF:')) {
+        isMaster = true;
+        const attrs = parseAttributes(line.substring('#EXT-X-STREAM-INF:'.length));
+        currentVariant = {
+          bandwidth: parseInt(attrs.BANDWIDTH) || 0,
+          resolution: attrs.RESOLUTION || '',
+          codecs: attrs.CODECS || '',
+          url: null,
+        };
+      } else if (currentVariant && !line.startsWith('#')) {
+        currentVariant.url = resolveUrl(line, baseUrl);
+        variants.push(currentVariant);
+        currentVariant = null;
+      } else if (line.startsWith('#EXT-X-MAP:')) {
+        const attrs = parseAttributes(line.substring('#EXT-X-MAP:'.length));
+        if (attrs.URI) initSegmentUrl = resolveUrl(attrs.URI.replace(/"/g, ''), baseUrl);
+      } else if (line.startsWith('#EXT-X-KEY:')) {
+        const attrs = parseAttributes(line.substring('#EXT-X-KEY:'.length));
+        keyInfo = {
+          method: attrs.METHOD || 'NONE',
+          uri: attrs.URI ? resolveUrl(attrs.URI.replace(/"/g, ''), baseUrl) : null,
+        };
+      } else if (!line.startsWith('#') && !isMaster) {
+        segments.push(resolveUrl(line, baseUrl));
+      }
+    }
+
+    return { isMaster, variants, segments, initSegmentUrl, keyInfo };
+  }
+
+  function concatArrayBuffers(buffers) {
+    const total = buffers.reduce((sum, b) => sum + b.byteLength, 0);
+    const result = new Uint8Array(total);
+    let offset = 0;
+    for (const buf of buffers) {
+      result.set(new Uint8Array(buf), offset);
+      offset += buf.byteLength;
+    }
+    return result.buffer;
+  }
+
+  const mb = (n) => Math.round(n / 1024 / 1024) + 'MB';
+
+  // 流式 fetch → ArrayBuffer，带取消与进度
+  async function fetchBuffer(url, { signal, onProgress } = {}) {
+    const resp = await fetch(url, { signal });
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const contentLength = parseInt(resp.headers.get('content-length') || '0');
+    if (!resp.body || !contentLength) return resp.arrayBuffer();
+    const reader = resp.body.getReader();
+    const chunks = [];
+    let received = 0;
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value);
+      received += value.length;
+      if (onProgress) onProgress(received, contentLength);
+    }
+    return concatArrayBuffers(chunks.map(c => c.buffer));
+  }
+
+  // 生成 (received, total) → onProgress 的适配器；无总长时进度停在区间末端仅更新文案
+  function makeStreamProgress(onProgress, base, span) {
+    return (recv, total) => {
+      if (total > 0) onProgress(base + (recv / total) * span, `下载中 ${mb(recv)} / ${mb(total)}`);
+      else onProgress(base + span, `下载中 ${mb(recv)}`);
+    };
+  }
+
+  // blob → chrome.downloads（offscreen 专属能力：SW 没有 URL.createObjectURL）
+  async function saveBlob(blob, filename) {
+    const url = URL.createObjectURL(blob);
+    try {
+      await chrome.downloads.download({ url, filename, saveAs: false });
+    } catch (e) {
+      try { URL.revokeObjectURL(url); } catch (e2) {}
+      throw new Error('下载失败: ' + e.message);
+    }
+    // 延迟释放，给下载管理器读取时间
+    setTimeout(() => { try { URL.revokeObjectURL(url); } catch (e) {} }, 60000);
+  }
+
+  // ---------- 任务执行器 ----------
+
+  // HLS：解析 m3u8 → 下载分段 → 拼接保存
+  async function runHlsTask(task, onProgress) {
+    const signal = task.abort.signal;
+    onProgress(0, '正在解析播放列表...');
+    const resp = await fetch(task.url, { signal });
+    const parsed = parseM3U8(await resp.text(), task.url);
+
+    if (parsed.keyInfo && parsed.keyInfo.method !== 'NONE') throw new Error('加密的 HLS 流暂不支持');
+
+    let segmentUrls = [];
+    let initSegment = null;
+
+    if (parsed.isMaster) {
+      const sorted = parsed.variants.sort((a, b) => b.bandwidth - a.bandwidth);
+      const selected = sorted[task.qualityIndex || 0] || sorted[0];
+      onProgress(5, `已选择: ${selected.resolution || '默认'}`);
+      const resp2 = await fetch(selected.url, { signal });
+      const parsed2 = parseM3U8(await resp2.text(), selected.url);
+      segmentUrls = parsed2.segments;
+      initSegment = parsed2.initSegmentUrl;
+      if (parsed2.keyInfo && parsed2.keyInfo.method !== 'NONE') throw new Error('加密的 HLS 流暂不支持');
+    } else {
+      segmentUrls = parsed.segments;
+      initSegment = parsed.initSegmentUrl;
+    }
+
+    if (!segmentUrls.length) throw new Error('未找到任何分段');
+
+    const buffers = [];
+    const total = segmentUrls.length + (initSegment ? 1 : 0);
+    if (initSegment) {
+      onProgress(2, '下载初始化分段...');
+      const r = await fetch(initSegment, { signal });
+      buffers.push(await r.arrayBuffer());
+    }
+    for (let i = 0; i < segmentUrls.length; i++) {
+      const segResp = await fetch(segmentUrls[i], { signal });
+      buffers.push(await segResp.arrayBuffer());
+      onProgress(((i + 1 + (initSegment ? 1 : 0)) / total) * 95, `下载分段 ${i + 1}/${segmentUrls.length}`);
+    }
+
+    onProgress(97, '正在合并分段...');
+    const merged = concatArrayBuffers(buffers);
+    const isFMP4 = initSegment !== null;
+    const ext = isFMP4 ? 'mp4' : 'ts';
+    const mimeType = isFMP4 ? 'video/mp4' : 'video/mp2t';
+    const finalName = task.filename.endsWith(`.${ext}`) ? task.filename : task.filename.replace(/\.[^.]+$/, '') + `.${ext}`;
+    await saveBlob(new Blob([merged], { type: mimeType }), finalName);
+  }
+
+  // B站 m4s 流（含备用线路）
+  async function runM4sTask(task, onProgress) {
+    const signal = task.abort.signal;
+    onProgress(0, '正在下载...');
+    let buffer;
+    try {
+      buffer = await fetchBuffer(task.url, { signal, onProgress: makeStreamProgress(onProgress, 0, 95) });
+    } catch (e) {
+      if (signal.aborted || e.name === 'AbortError') throw e;
+      if (!task.backupUrl) throw e;
+      onProgress(0, '使用备用线路下载...');
+      buffer = await fetchBuffer(task.backupUrl, { signal, onProgress: makeStreamProgress(onProgress, 0, 95) });
+    }
+    onProgress(97, '正在处理...');
+    await saveBlob(new Blob([buffer], { type: 'video/mp4' }), task.filename);
+  }
+
+  // 直接 URL 视频
+  async function runDirectTask(task, onProgress) {
+    const signal = task.abort.signal;
+    onProgress(0, '正在下载...');
+    const buffer = await fetchBuffer(task.url, { signal, onProgress: makeStreamProgress(onProgress, 0, 95) });
+
+    onProgress(97, '正在处理...');
+    let mimeType = 'application/octet-stream';
+    const ext = (task.filename.match(/\.[^.]+$/) || ['.mp4'])[0].slice(1).toLowerCase();
+    if (task.mediaType === 'video') mimeType = ext === 'flv' ? 'video/x-flv' : 'video/mp4';
+    else if (task.mediaType === 'audio') mimeType = `audio/${ext}`;
+    await saveBlob(new Blob([buffer], { type: mimeType }), task.filename);
+  }
+
+  // 音频：dash-audio 直存/转码；hls/视频源先下载再提取
+  async function runAudioTask(task, onProgress) {
+    const signal = task.abort.signal;
+    const { sourceType, format, bitrate, codecs } = task;
+    const ctx = task.ctx || {};
+    let arrayBuffer;
+
+    if (sourceType === 'dash-audio') {
+      onProgress(0, '下载音频流...');
+      try {
+        arrayBuffer = await fetchBuffer(task.url, { signal, onProgress: makeStreamProgress(onProgress, 0, 45) });
+      } catch (e) {
+        if (signal.aborted || e.name === 'AbortError') throw e;
+        if (!task.backupUrl) throw e;
+        onProgress(0, '使用备用线路下载音频...');
+        arrayBuffer = await fetchBuffer(task.backupUrl, { signal, onProgress: makeStreamProgress(onProgress, 0, 45) });
+      }
+
+      // FLAC 源直接保存，无需转码
+      if ((codecs || '').includes('fLaC')) {
+        onProgress(95, '保存 FLAC...');
+        await saveBlob(new Blob([arrayBuffer], { type: 'audio/flac' }), task.filename);
+        return;
+      }
+    } else if (sourceType === 'hls') {
+      onProgress(0, '下载 HLS 分段...');
+      const resp = await fetch(task.url, { signal });
+      const parsed = parseM3U8(await resp.text(), task.url);
+      let segmentUrls = [];
+      if (parsed.isMaster) {
+        const sorted = parsed.variants.sort((a, b) => b.bandwidth - a.bandwidth);
+        const selected = sorted[task.qualityIndex || 0] || sorted[0];
+        const resp2 = await fetch(selected.url, { signal });
+        segmentUrls = parseM3U8(await resp2.text(), selected.url).segments;
+      } else {
+        segmentUrls = parsed.segments;
+      }
+      const buffers = [];
+      for (let i = 0; i < segmentUrls.length; i++) {
+        const r = await fetch(segmentUrls[i], { signal });
+        buffers.push(await r.arrayBuffer());
+        onProgress(((i + 1) / segmentUrls.length) * 45, `下载分段 ${i + 1}/${segmentUrls.length}`);
+      }
+      arrayBuffer = concatArrayBuffers(buffers);
+    } else {
+      onProgress(0, '下载视频流...');
+      arrayBuffer = await fetchBuffer(task.url, { signal, onProgress: makeStreamProgress(onProgress, 0, 45) });
+    }
+
+    onProgress(50, '正在提取并编码音频...');
+    const blob = await extractAudioToBlob(arrayBuffer, format, bitrate, ctx,
+      (p, m) => onProgress(50 + (p / 100) * 45, m), signal);
+    await saveBlob(blob, task.filename);
+  }
+
+  // 音频提取 + 编码（原 EXTRACT_AUDIO 消息核心，改为函数供任务调用）
+  async function extractAudioToBlob(arrayBuffer, format, bitrate, ctx, onProgress, signal) {
+    if (!arrayBuffer || arrayBuffer.byteLength === 0) throw new Error('无音频数据');
+
+    onProgress(10, '正在解码音频...');
+    let audioBuffer = await tryFastDecode(arrayBuffer);
+
+    if (!audioBuffer) {
+      onProgress(20, '正在实时提取音频（可能需要一些时间）...');
+      audioBuffer = await captureAudioFromVideo(arrayBuffer, undefined, ctx, signal);
+    }
+
+    onProgress(70, `正在编码为 ${(format || 'mp3').toUpperCase()}...`);
+    let blob;
+    if (format === 'wav' || format === 'flac') {
+      // FLAC 编码需要额外库，暂用 WAV 作为无损替代
+      blob = encodeWAV(audioBuffer);
+    } else {
+      blob = encodeMP3(audioBuffer, bitrate || 320);
+    }
+
+    onProgress(95, '编码完成，准备下载...');
+    return blob;
+  }
+
+  // 视频+音频合并：下载两路流 → 快速 remux（失败回退 MediaRecorder 实时录制）
+  async function runMergeTask(task, onProgress) {
+    const signal = task.abort.signal;
+
+    // 1. 下载视频流
+    onProgress(2, '下载视频流...');
+    let videoBuffer;
+    try {
+      videoBuffer = await fetchBuffer(task.video.url, { signal, onProgress: makeStreamProgress(onProgress, 2, 30) });
+    } catch (e) {
+      if (signal.aborted || e.name === 'AbortError') throw e;
+      if (!task.video.backupUrl) throw e;
+      onProgress(2, '视频流使用备用线路...');
+      videoBuffer = await fetchBuffer(task.video.backupUrl, { signal, onProgress: makeStreamProgress(onProgress, 2, 30) });
+    }
+
+    // 2. 下载音频流
+    onProgress(35, '下载音频流...');
+    let audioBuffer;
+    try {
+      audioBuffer = await fetchBuffer(task.audio.url, { signal, onProgress: makeStreamProgress(onProgress, 35, 10) });
+    } catch (e) {
+      if (signal.aborted || e.name === 'AbortError') throw e;
+      if (!task.audio.backupUrl) throw e;
+      onProgress(35, '音频流使用备用线路...');
+      audioBuffer = await fetchBuffer(task.audio.backupUrl, { signal, onProgress: makeStreamProgress(onProgress, 35, 10) });
+    }
+
+    // 3. 合并（进度刻度沿用 48-97）
+    onProgress(48, '正在初始化合并...');
+    const ctx = {
+      ...(task.ctx || {}),
+      videoUrl: task.video.url,
+      audioUrl: task.audio.url,
+      videoSize: videoBuffer.byteLength,
+      audioSize: audioBuffer.byteLength,
+    };
+
+    let result;
+    try {
+      onProgress(52, '快速合并：解析 fragmented MP4（无重编码）...');
+      result = await fastRemuxMP4(videoBuffer, audioBuffer, ctx, onProgress);
+    } catch (e) {
+      if (signal.aborted || e.name === 'AbortError') throw e;
+      console.log('[VC-Offscreen] 快速合并不可用，回退实时录制:', e.message);
+      onProgress(50, '快速模式不可用，切换实时录制...');
+      result = await mergeVideoAudio(videoBuffer, audioBuffer, ctx, onProgress, signal);
+    }
+
+    onProgress(99, '正在保存...');
+    await saveBlob(result.blob, `${task.filename}.${result.ext}`);
+  }
+
   // ==================== 消息处理 ====================
 
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message.target !== 'offscreen') return;
 
-    if (message.type === 'MERGE_VIDEO_AUDIO') {
-      (async () => {
-        try {
-          const { videoBuffer, audioBuffer, filename, mergeId, tabId, ctx } = message;
-          chrome.runtime.sendMessage({
-            type: 'AUDIO_PROGRESS',
-            progress: 48,
-            message: '正在初始化合并...',
-          }).catch(() => {});
-
-          // 优先走快速无重编码 remux（fMP4 → 秒级合并）；
-          // 失败（非 fMP4 / 结构异常）回退到 MediaRecorder 实时录制
-          let result;
-          try {
-            chrome.runtime.sendMessage({
-              type: 'AUDIO_PROGRESS',
-              progress: 52,
-              message: '快速合并：解析 fragmented MP4（无重编码）...',
-            }).catch(() => {});
-            result = await fastRemuxMP4(videoBuffer, audioBuffer, filename, ctx);
-          } catch (e) {
-            console.log('[VC-Offscreen] 快速合并不可用，回退实时录制:', e.message);
-            chrome.runtime.sendMessage({
-              type: 'AUDIO_PROGRESS',
-              progress: 50,
-              message: '快速模式不可用，切换实时录制...',
-            }).catch(() => {});
-            result = await mergeVideoAudio(videoBuffer, audioBuffer, filename, mergeId, tabId, ctx);
-          }
-
-          sendResponse({ success: true, ext: result.ext });
-        } catch (e) {
-          console.error('[VC-Offscreen] 合并失败:', e);
-          // 透出 diagnostics 供 popup 渲染 Bug 报告
-          sendResponse({
-            error: e.message,
-            diagnostics: e.diagnostics || null,
-          });
-        }
-      })();
+    // ----- 后台下载任务（常驻 offscreen 执行，popup 关闭不影响） -----
+    if (message.type === 'START_DOWNLOAD') {
+      try {
+        const taskId = startTask(message.task || {});
+        sendResponse({ ok: true, taskId });
+      } catch (e) {
+        sendResponse({ error: e.message });
+      }
       return true;
     }
 
-    // background Service Worker 没有 URL.createObjectURL，所有 Blob 下载都委托给 offscreen
-    if (message.type === 'DOWNLOAD_BLOB') {
-      (async () => {
-        try {
-          const { arrayBuffer, filename, mimeType } = message;
-          if (!arrayBuffer || arrayBuffer.byteLength === 0) {
-            sendResponse({ error: '无数据' });
-            return;
-          }
-          const blob = new Blob([arrayBuffer], { type: mimeType || 'application/octet-stream' });
-          const url = URL.createObjectURL(blob);
-          await chrome.downloads.download({
-            url: url,
-            filename: filename,
-            saveAs: false,
-          });
-          setTimeout(() => { try { URL.revokeObjectURL(url); } catch (e) {} }, 60000);
-          sendResponse({ success: true });
-        } catch (e) {
-          console.error('[VC-Offscreen] 下载失败:', e);
-          sendResponse({ error: e.message });
-        }
-      })();
+    // 只有用户在 popup 中明确确认后才会发来这条消息
+    if (message.type === 'CANCEL_DOWNLOAD') {
+      const ok = cancelTask(message.taskId);
+      sendResponse({ ok });
       return true;
     }
 
-    if (message.type === 'EXTRACT_AUDIO') {
-      (async () => {
-        try {
-          const { arrayBuffer, format, bitrate, ctx } = message;
+    if (message.type === 'GET_DOWNLOAD_STATUS') {
+      sendResponse({ tasks: [...downloadTasks.values()].map(serializeTask) });
+      return true;
+    }
 
-          if (!arrayBuffer || arrayBuffer.byteLength === 0) {
-            sendResponse({ error: '无音频数据' });
-            return;
-          }
-
-          // 报告进度
-          chrome.runtime.sendMessage({
-            type: 'AUDIO_PROGRESS',
-            progress: 10,
-            message: '正在解码音频...',
-          }).catch(() => {});
-
-          // 尝试快速解码
-          let audioBuffer = await tryFastDecode(arrayBuffer);
-
-          if (!audioBuffer) {
-            // 快速解码失败，使用 video 元素实时提取
-            chrome.runtime.sendMessage({
-              type: 'AUDIO_PROGRESS',
-              progress: 20,
-              message: '正在实时提取音频（可能需要一些时间）...',
-            }).catch(() => {});
-
-            audioBuffer = await captureAudioFromVideo(arrayBuffer, undefined, ctx);
-          }
-
-          // 编码
-          chrome.runtime.sendMessage({
-            type: 'AUDIO_PROGRESS',
-            progress: 70,
-            message: `正在编码为 ${format.toUpperCase()}...`,
-          }).catch(() => {});
-
-          let blob;
-          if (format === 'wav') {
-            blob = encodeWAV(audioBuffer);
-          } else if (format === 'flac') {
-            // FLAC 编码需要额外库，暂用 WAV 作为无损替代
-            blob = encodeWAV(audioBuffer);
-          } else {
-            // 默认 MP3
-            blob = encodeMP3(audioBuffer, bitrate || 320);
-          }
-
-          chrome.runtime.sendMessage({
-            type: 'AUDIO_PROGRESS',
-            progress: 95,
-            message: '编码完成，准备下载...',
-          }).catch(() => {});
-
-          sendResponse({ blob: blob });
-        } catch (e) {
-          console.error('[VC-Offscreen] 音频处理失败:', e);
-          sendResponse({
-            error: e.message,
-            diagnostics: e.diagnostics || null,
-          });
-        }
-      })();
-      return true; // 保持通道
+    if (message.type === 'DISMISS_TASK') {
+      const t = downloadTasks.get(message.taskId);
+      if (t && t.status !== 'running') downloadTasks.delete(message.taskId);
+      sendResponse({ ok: true });
+      return true;
     }
 
     if (message.type === 'PING_OFFSCREEN') {

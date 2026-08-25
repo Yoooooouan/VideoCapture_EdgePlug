@@ -1,6 +1,7 @@
 /**
  * popup/popup.js
- * 弹窗逻辑：加载媒体列表、渲染卡片、处理下载、显示进度
+ * 弹窗逻辑：加载媒体列表、渲染卡片、派发下载、后台任务区展示与取消
+ * 下载任务常驻 offscreen 引擎执行：关闭弹窗不中断，重开自动恢复进度。
  */
 
 (function () {
@@ -82,14 +83,16 @@
   document.addEventListener('DOMContentLoaded', init);
 
   async function init() {
-    // 监听来自 background 的进度消息
+    // 监听来自 offscreen 下载引擎的进度广播
     chrome.runtime.onMessage.addListener((message) => {
       if (message.type === 'DOWNLOAD_PROGRESS') {
         handleProgressUpdate(message);
       }
     });
 
+    // 先渲染媒体卡片，再恢复后台任务（任务联动卡片依赖卡片已存在）
     await loadMediaList();
+    await refreshTasks();
   }
 
   // ==================== 加载媒体列表 ====================
@@ -517,12 +520,192 @@
         showProgress(videoMedia.id, -1, '❌ ' + resp.error);
         if (resp.diagnostics) showDiagnostics(videoMedia.id, resp.diagnostics);
         setButtonsDisabled(videoMedia.id, false);
+      } else if (resp && resp.taskId) {
+        // 任务已交给 offscreen 常驻执行，关闭弹窗不会中断
+        showProgress(videoMedia.id, 1, '已加入后台下载，关闭弹窗不会中断');
       }
-      // 成功则等待 DOWNLOAD_PROGRESS 消息
     } catch (e) {
       showProgress(videoMedia.id, -1, '❌ ' + e.message);
       setButtonsDisabled(videoMedia.id, false);
     }
+  }
+
+  // ==================== 后台下载任务区 ====================
+  // 任务常驻 offscreen 引擎执行：误触关闭弹窗不中断下载，
+  // 重新打开 popup 自动恢复任务列表与进度；取消必须用户明确确认。
+
+  let taskList = [];
+
+  async function refreshTasks() {
+    try {
+      const resp = await chrome.runtime.sendMessage({
+        target: 'offscreen',
+        type: 'GET_DOWNLOAD_STATUS',
+      });
+      taskList = (resp && resp.tasks) || [];
+    } catch (e) {
+      // offscreen 未创建 = 没有任何后台任务
+      taskList = [];
+    }
+    renderTasks();
+  }
+
+  function modeIcon(t) {
+    if (t.mode === 'merge') return '🎬';
+    if (t.mode === 'audio') return '🎵';
+    return '⬇';
+  }
+
+  function renderTasks() {
+    const box = document.getElementById('tasks');
+    if (!box) return;
+
+    if (!taskList.length) {
+      box.style.display = 'none';
+      box.innerHTML = '';
+      return;
+    }
+    box.style.display = 'block';
+
+    // 表头（只建一次）
+    let head = document.getElementById('tasks-head');
+    if (!head) {
+      head = document.createElement('div');
+      head.id = 'tasks-head';
+      head.className = 'tasks-head';
+      head.textContent = '⬇ 后台下载（关闭弹窗不中断）';
+      box.appendChild(head);
+    }
+
+    const seen = new Set();
+    taskList.forEach((t) => {
+      seen.add(t.taskId);
+      let row = document.getElementById(`task-${t.taskId}`);
+      const rowStatus = row ? row.dataset.status : null;
+
+      if (row && rowStatus === t.status && t.status === 'running') {
+        // 增量更新进度，避免整行重绘导致进度条闪烁
+        const st = row.querySelector('.status-text');
+        const fill = row.querySelector('.progress-fill');
+        if (st) st.textContent = t.message || '';
+        if (fill) fill.style.width = Math.min(Math.max(t.progress || 0, 0), 100) + '%';
+      } else {
+        if (row) row.remove();
+        box.insertBefore(buildTaskRow(t), head.nextSibling); // 新任务置顶
+      }
+    });
+
+    // 清掉已不存在的行
+    box.querySelectorAll('.task-item').forEach((el) => {
+      if (!seen.has(el.id.replace('task-', ''))) el.remove();
+    });
+
+    // 进行中的任务：联动媒体卡片（禁用按钮 + 恢复进度条显示）
+    taskList.filter(t => t.status === 'running' && t.mediaId).forEach((t) => {
+      setButtonsDisabled(t.mediaId, true);
+      showProgress(t.mediaId, t.progress, t.message);
+    });
+  }
+
+  function buildTaskRow(t) {
+    const row = document.createElement('div');
+    row.className = 'task-item' + (t.status !== 'running' ? ' task-' + t.status : '');
+    row.id = `task-${t.taskId}`;
+    row.dataset.status = t.status;
+
+    const isRunning = t.status === 'running';
+    const statusHtml = isRunning
+      ? `<div class="status-text">${escapeHtml(t.message || '')}</div>
+         <div class="progress-bar"><div class="progress-fill" style="width:${Math.min(Math.max(t.progress || 0, 0), 100)}%"></div></div>`
+      : `<div class="status-text">${escapeHtml(t.message || '')}</div>`;
+
+    const actions = isRunning
+      ? `<button class="btn-task-cancel" data-taskid="${t.taskId}" title="取消下载（需确认）">✕ 取消</button>`
+      : `<button class="btn-task-dismiss" data-taskid="${t.taskId}">移除</button>`;
+
+    row.innerHTML = `
+      <div class="task-top">
+        <span class="task-icon">${modeIcon(t)}</span>
+        <span class="task-title" title="${escapeHtml(t.title || '')}">${escapeHtml(t.title || '下载任务')}</span>
+        ${actions}
+      </div>
+      ${statusHtml}
+      ${(t.status === 'error' && t.diagnostics)
+        ? `<button class="btn-task-diag" data-taskid="${t.taskId}">📋 复制 Bug 报告</button>`
+        : ''}
+    `;
+
+    row.querySelectorAll('[data-taskid]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const id = btn.dataset.taskid;
+        if (btn.classList.contains('btn-task-cancel')) cancelTask(id, btn);
+        else if (btn.classList.contains('btn-task-dismiss')) dismissTask(id);
+        else if (btn.classList.contains('btn-task-diag')) copyTaskDiag(id, btn);
+      });
+    });
+
+    return row;
+  }
+
+  let cancelArmTimer = null;
+
+  async function cancelTask(taskId, btn) {
+    // 两段式确认（popup 中原生 confirm 会导致弹窗失焦自关，故用行内确认）：
+    // 第一次点击进入"待确认"状态，3 秒内再次点击才真正取消。
+    if (!btn.dataset.armed) {
+      btn.dataset.armed = '1';
+      btn.textContent = '⚠ 确认取消？';
+      btn.classList.add('armed');
+      if (cancelArmTimer) clearTimeout(cancelArmTimer);
+      cancelArmTimer = setTimeout(() => {
+        btn.dataset.armed = '';
+        btn.textContent = '✕ 取消';
+        btn.classList.remove('armed');
+      }, 3000);
+      return;
+    }
+    if (cancelArmTimer) { clearTimeout(cancelArmTimer); cancelArmTimer = null; }
+    btn.disabled = true;
+    try {
+      await chrome.runtime.sendMessage({
+        target: 'offscreen',
+        type: 'CANCEL_DOWNLOAD',
+        taskId,
+      });
+    } catch (e) {
+      // offscreen 已不在（如浏览器重启），忽略
+    }
+    // 状态更新由 DOWNLOAD_PROGRESS 广播驱动；兜底延迟刷新
+    setTimeout(refreshTasks, 800);
+  }
+
+  async function dismissTask(taskId) {
+    try {
+      await chrome.runtime.sendMessage({
+        target: 'offscreen',
+        type: 'DISMISS_TASK',
+        taskId,
+      });
+    } catch (e) {}
+    taskList = taskList.filter(t => t.taskId !== taskId);
+    renderTasks();
+  }
+
+  function copyTaskDiag(taskId, btn) {
+    const t = taskList.find(x => x.taskId === taskId);
+    if (!t || !t.diagnostics) return;
+    const report = t.diagnostics.bugReport || JSON.stringify(t.diagnostics, null, 2);
+    copyToClipboard(report).then(() => {
+      btn.textContent = '✅ 已复制到剪贴板';
+      btn.disabled = true;
+      setTimeout(() => {
+        btn.textContent = '📋 复制 Bug 报告';
+        btn.disabled = false;
+      }, 2000);
+    }).catch(() => {
+      btn.textContent = '❌ 复制失败，请查看控制台';
+      console.error('[VC] Bug 报告复制失败，内容如下：\n', report);
+    });
   }
 
   // ==================== 下载处理 ====================
@@ -543,8 +726,9 @@
         showProgress(media.id, -1, '❌ ' + resp.error);
         if (resp.diagnostics) showDiagnostics(media.id, resp.diagnostics);
         setButtonsDisabled(media.id, false);
+      } else if (resp && resp.taskId) {
+        showProgress(media.id, 1, '已加入后台下载，关闭弹窗不会中断');
       }
-      // 成功则等待 DOWNLOAD_PROGRESS 消息
     } catch (e) {
       showProgress(media.id, -1, '❌ ' + e.message);
       setButtonsDisabled(media.id, false);
@@ -581,6 +765,8 @@
         showProgress(media.id, -1, '❌ ' + resp.error);
         if (resp.diagnostics) showDiagnostics(media.id, resp.diagnostics);
         setButtonsDisabled(media.id, false);
+      } else if (resp && resp.taskId) {
+        showProgress(media.id, 1, '已加入后台下载，关闭弹窗不会中断');
       }
     } catch (e) {
       showProgress(media.id, -1, '❌ ' + e.message);
@@ -589,14 +775,33 @@
   }
 
   // ==================== 进度更新 ====================
+  // 消息来自 offscreen 下载引擎（DOWNLOAD_PROGRESS 广播），
+  // 同时更新顶部任务区与媒体卡片内进度。
   function handleProgressUpdate(message) {
+    if (message.taskId) {
+      const t = taskList.find(x => x.taskId === message.taskId);
+      if (t) {
+        Object.assign(t, message);
+      } else {
+        taskList.unshift(message); // 新任务置顶
+      }
+      renderTasks();
+    }
+
     if (!message.mediaId) return;
-    showProgress(message.mediaId, message.progress, message.message);
-    if (message.progress >= 100) {
-      setTimeout(() => setButtonsDisabled(message.mediaId, false), 1000);
-    } else if (message.progress < 0) {
-      // 错误状态
+
+    if (message.status === 'error') {
+      showProgress(message.mediaId, -1, '❌ ' + (message.error || message.message));
+      if (message.diagnostics) showDiagnostics(message.mediaId, message.diagnostics);
       setButtonsDisabled(message.mediaId, false);
+    } else if (message.status === 'cancelled') {
+      showProgress(message.mediaId, -1, '⏹ 已取消');
+      setButtonsDisabled(message.mediaId, false);
+    } else if (message.status === 'done') {
+      showProgress(message.mediaId, 100, '✅ ' + (message.message || '下载完成'));
+      setTimeout(() => setButtonsDisabled(message.mediaId, false), 1000);
+    } else {
+      showProgress(message.mediaId, message.progress, message.message);
     }
   }
 
