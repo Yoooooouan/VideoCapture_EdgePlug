@@ -12,6 +12,68 @@
   // B站合并卡片：audioMediaId → videoMediaId（卡片进度条/按钮挂在 videoMedia.id 上）
   const combinedAnchor = new Map();
 
+  // ==================== 下载大小预估 ====================
+  function formatBytes(n) {
+    if (n === null || n === undefined || isNaN(n) || n <= 0) return '未知';
+    if (n < 1024) return n + ' B';
+    if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
+    if (n < 1024 * 1024 * 1024) return (n / 1024 / 1024).toFixed(2) + ' MB';
+    return (n / 1024 / 1024 / 1024).toFixed(2) + ' GB';
+  }
+
+  function formatEstimate(resp) {
+    if (!resp || resp.error) return '—';
+    const parts = [];
+    if (resp.estimatedBytes && resp.estimatedBytes > 0) {
+      const tag = resp.isExact
+        ? '<b style="color:#2e7d32;">精确</b>'
+        : '预估';
+      parts.push(`${tag} ${formatBytes(resp.estimatedBytes)}`);
+    } else if (resp.perMinuteBytes && resp.perMinuteBytes > 0) {
+      parts.push(`≈ ${formatBytes(resp.perMinuteBytes)}/分钟`);
+    } else {
+      parts.push('未知');
+    }
+    if (resp.qualityLabel) {
+      parts.push(`<span style="color:#999;font-size:10px;">(${escapeHtml(resp.qualityLabel)})</span>`);
+    }
+    return parts.join(' ');
+  }
+
+  // mode: 'video' | 'audio' | 'merge'
+  async function updateEstimate(media, mode) {
+    const suffix = mode === 'merge' ? 'merge' : (mode === 'audio' ? 'audio' : 'video');
+    const el = document.getElementById(`est-${suffix}-${media.id}`);
+    if (!el) return;
+
+    let qualityIndex = 0;
+    const qSel = document.getElementById(`quality-${media.id}`);
+    if (qSel) qualityIndex = parseInt(qSel.value, 10) || 0;
+
+    let audioFormat = 'mp3-320';
+    const fSel = document.getElementById(`audiofmt-${media.id}`);
+    if (fSel) audioFormat = fSel.value;
+
+    el.innerHTML = '计算中…';
+    try {
+      const resp = await chrome.runtime.sendMessage({
+        type: 'ESTIMATE_SIZE',
+        mediaId: media.id,
+        mode,
+        qualityIndex,
+        audioFormat,
+      });
+      el.innerHTML = formatEstimate(resp);
+    } catch (e) {
+      el.innerHTML = '—';
+    }
+  }
+
+  function triggerCardEstimates(media) {
+    if (canDownloadVideo(media)) updateEstimate(media, 'video');
+    if (canDownloadAudio(media)) updateEstimate(media, 'audio');
+  }
+
   function resolveCardId(mediaId) {
     return combinedAnchor.get(mediaId) || mediaId;
   }
@@ -123,11 +185,14 @@
         // 合并卡片（主入口）
         const card = renderBilibiliCombinedCard(videoMedia, audioMedia, downloadProgress);
         content.appendChild(card);
+        updateEstimate(videoMedia, 'merge');
+        updateEstimate(audioMedia, 'audio');
 
         // 渲染其余媒体项（网络拦截到的其他流）
         mediaList.filter(m => m !== videoMedia && m !== audioMedia).forEach((media) => {
           const c = renderVideoCard(media, downloadProgress);
           content.appendChild(c);
+          triggerCardEstimates(media);
         });
         return;
       }
@@ -143,6 +208,7 @@
     mediaList.forEach((media) => {
       const card = renderVideoCard(media, downloadProgress);
       content.appendChild(card);
+      triggerCardEstimates(media);
     });
   }
 
@@ -200,6 +266,11 @@
           ).join('')}
         </select>`;
       options.appendChild(row);
+      const qSel = row.querySelector('select');
+      qSel.addEventListener('change', () => {
+        if (canDownloadVideo(media)) updateEstimate(media, 'video');
+        if (canDownloadAudio(media)) updateEstimate(media, 'audio');
+      });
     }
 
     // 音频格式选择
@@ -216,9 +287,26 @@
           <option value="flac">FLAC 无损</option>
         </select>`;
       options.appendChild(row);
+      const fSel = row.querySelector('select');
+      fSel.addEventListener('change', () => updateEstimate(media, 'audio'));
     }
 
     card.appendChild(options);
+
+    // --- 预估大小区域 ---
+    const estBlock = document.createElement('div');
+    estBlock.className = 'estimate-block';
+    let estHtml = '';
+    if (canDownloadVideo(media)) {
+      estHtml += `<div class="estimate-row"><span class="estimate-label">📦 视频预估：</span><span id="est-video-${media.id}">计算中…</span></div>`;
+    }
+    if (canDownloadAudio(media)) {
+      estHtml += `<div class="estimate-row"><span class="estimate-label">🎵 音频预估：</span><span id="est-audio-${media.id}">计算中…</span></div>`;
+    }
+    if (estHtml) {
+      estBlock.innerHTML = estHtml;
+      card.appendChild(estBlock);
+    }
 
     // --- 按钮区域 ---
     const btnGroup = document.createElement('div');
@@ -329,6 +417,11 @@
           ).join('')}
         </select>`;
       options.appendChild(row);
+      const qSel = row.querySelector('select');
+      qSel.addEventListener('change', () => {
+        updateEstimate(videoMedia, 'merge');
+        updateEstimate(audioMedia, 'audio');
+      });
     }
 
     // 音频格式选择（仅"下载音频"时生效，id 用 audioMedia.id 与 handleDownloadAudio 对齐）
@@ -344,8 +437,18 @@
         <option value="flac">FLAC 无损</option>
       </select>`;
     options.appendChild(row2);
+    const fSel = row2.querySelector('select');
+    fSel.addEventListener('change', () => updateEstimate(audioMedia, 'audio'));
 
     card.appendChild(options);
+
+    // --- 预估大小区域 ---
+    const estBlock = document.createElement('div');
+    estBlock.className = 'estimate-block';
+    estBlock.innerHTML = `
+      <div class="estimate-row"><span class="estimate-label">📦 合并预估：</span><span id="est-merge-${videoMedia.id}">计算中…</span></div>
+      <div class="estimate-row"><span class="estimate-label">🎵 仅音频预估：</span><span id="est-audio-${audioMedia.id}">计算中…</span></div>`;
+    card.appendChild(estBlock);
 
     // --- 按钮区域：①合并 ②仅视频 ③仅音频 ---
     const btnGroup = document.createElement('div');

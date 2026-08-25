@@ -17,6 +17,44 @@ const MEDIA_EXT_RE = /\.(m3u8|mp4|m4s|flv|ts|m4a|aac|mp3|wav|flac|webm|ogg)(\?|#
 const BILIBILI_CDN_RE = /bilivideo\.(com|cn)|akamaized\.net|szbdos\.com/i;
 const DOUYIN_CDN_RE = /douyinvod\.com|douyin\.com|bytecdn/i;
 
+// ==================== 下载大小预估 ====================
+// 音频目标格式对应的码率（bps）。FLAC 当前实现实为 WAV 编码，按 WAV 计。
+const AUDIO_FORMAT_BITRATE = {
+  'mp3-320': 320000,
+  'mp3-192': 192000,
+  'mp3-128': 128000,
+  'wav': 1411200,   // 16-bit PCM @ 44.1kHz × 2 声道 ≈ 1411.2 kbps
+  'flac': 1411200,  // 当前实现 FLAC 实为 WAV 编码，按 WAV 计
+};
+const MERGE_AUDIO_BITRATE = 192000; // offscreen MediaRecorder 的 audioBitsPerSecond（合并音频固定值）
+
+function formatBytes(n) {
+  if (n === null || n === undefined || isNaN(n)) return '未知';
+  if (n < 1024) return n + ' B';
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
+  if (n < 1024 * 1024 * 1024) return (n / 1024 / 1024).toFixed(2) + ' MB';
+  return (n / 1024 / 1024 / 1024).toFixed(2) + ' GB';
+}
+
+// 基于码率(bps)与时长(s)预估下载字节数
+// mode: 'video' | 'audio' | 'merge'
+function estimateMediaSize(media, { mode, qualityIndex = 0, audioFormat = 'mp3-320' }) {
+  const duration = media.duration || 0;
+  const qOpts = media.qualityOptions || [];
+  const vQ = qOpts[qualityIndex] || qOpts[0];
+  const vBps = vQ ? (vQ.bandwidth || 0) : 0;                       // 选中清晰度的视频码率
+  const fmtBps = AUDIO_FORMAT_BITRATE[audioFormat] || 192000;      // 目标音频格式码率
+
+  let totalBps = 0;
+  if (mode === 'video') totalBps = vBps;                          // 仅视频：所选清晰度码率
+  else if (mode === 'audio') totalBps = fmtBps;                   // 仅音频：大小取决于所选格式
+  else if (mode === 'merge') totalBps = vBps + MERGE_AUDIO_BITRATE; // 合并：视频源码率 + 192k 音频
+
+  const bytes = duration > 0 ? (totalBps / 8) * duration : null;
+  const perMinute = totalBps > 0 ? (totalBps / 8) * 60 : null;
+  return { bytes, perMinute, hasDuration: duration > 0, totalBps, vBps, fmtBps };
+}
+
 // ==================== Tab 状态管理 ====================
 
 const tabStates = new Map();
@@ -434,6 +472,33 @@ function concatArrayBuffers(buffers) {
     offset += buf.byteLength;
   }
   return result.buffer;
+}
+
+// 通过 Range 请求获取文件总大小（精确下载大小），失败返回 null
+async function fetchContentLength(url) {
+  if (!url || !url.startsWith('http')) return null;
+  try {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 4000);
+    const resp = await fetch(url, {
+      method: 'GET',
+      headers: { Range: 'bytes=0-0' },
+      signal: ctrl.signal,
+    });
+    clearTimeout(timer);
+    // 206 Range：Content-Range: bytes 0-0/TOTAL
+    const cr = resp.headers.get('content-range');
+    if (cr) {
+      const m = cr.match(/\/(\d+)\s*$/);
+      if (m) return parseInt(m[1], 10);
+    }
+    // 200 完整响应或服务器忽略 Range
+    const cl = resp.headers.get('content-length');
+    if (cl) return parseInt(cl, 10);
+    return null;
+  } catch (e) {
+    return null;
+  }
 }
 
 // 注意：MV3 Service Worker 中没有 URL.createObjectURL，
@@ -1104,6 +1169,57 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       } catch (e) {
         console.error('[VC] 下载音频失败:', e);
         sendResponse({ error: e.message, diagnostics: e.diagnostics || null });
+      }
+    })();
+    return true;
+  }
+
+  // ==================== 下载大小预估 ====================
+  if (message.type === 'ESTIMATE_SIZE') {
+    (async () => {
+      try {
+        const { mediaId, mode, qualityIndex, audioFormat, tabId: msgTabId } = message;
+        const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+        const tabId = tab?.id || msgTabId;
+        const state = getTabState(tabId);
+        const media = state.mediaList.find(m => m.id === mediaId);
+        if (!media) { sendResponse({ error: '未找到媒体' }); return; }
+
+        const qIndex = qualityIndex || 0;
+        const est = estimateMediaSize(media, {
+          mode,
+          qualityIndex: qIndex,
+          audioFormat: audioFormat || 'mp3-320',
+        });
+
+        // 仅"仅视频"下载可用服务器返回的精确文件大小
+        // （音频会因格式转换而变化大小，合并会因 MediaRecorder 重编码而变化，故不取精确值）
+        let finalBytes = est.bytes;
+        let isExact = false;
+        const singleUrlTypes = ['video', 'dash', 'dash-video', 'dash-audio'];
+        if (singleUrlTypes.includes(media.type) && mode === 'video') {
+          const q = (media.qualityOptions && media.qualityOptions[qIndex]) || media;
+          const url = q.url || q.baseUrl || media.url;
+          if (url && url.startsWith('http')) {
+            const cl = await fetchContentLength(url);
+            if (cl && cl > 0) { finalBytes = cl; isExact = true; }
+          }
+        }
+
+        const qualityLabel = (media.qualityOptions && media.qualityOptions[qIndex]?.label) || '';
+        sendResponse({
+          mode,
+          estimatedBytes: finalBytes,
+          perMinuteBytes: est.perMinute,
+          hasDuration: est.hasDuration,
+          isExact,
+          qualityLabel,
+          audioFormat: audioFormat || 'mp3-320',
+          note: isExact ? '精确（服务器文件大小）'
+            : (est.hasDuration ? '预估（码率×时长）' : '预估（码率/分钟）'),
+        });
+      } catch (e) {
+        sendResponse({ error: e.message });
       }
     })();
     return true;
