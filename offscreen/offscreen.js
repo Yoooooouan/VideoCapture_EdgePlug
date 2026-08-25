@@ -524,7 +524,270 @@
     });
   }
 
-  // ==================== 视频+音频合并（MediaRecorder） ====================
+  // ==================== 快速音视频合并（fMP4 无重编码 remux） ====================
+  // B站 DASH 的视频/音频 m4s 是自包含 fragmented MP4（moov + moof/mdat）。
+  // 通过盒级拼接 + track_id 重写把两路独立 fMP4 合成单文件：
+  //   不解码、不重编码、不实时播放 → 合并耗时≈内存拷贝（秒级），
+  //   远快于 MediaRecorder 实时录制（旧实现耗时≈视频时长且重编码）。
+  // 非 fMP4 / 结构异常输入会抛错，由调用方回退到 MediaRecorder 实时录制。
+
+  // 读取 box type（4 字符 ASCII，big-endian）
+  function _boxType(u8, off) {
+    return String.fromCharCode(u8[off + 4], u8[off + 5], u8[off + 6], u8[off + 7]);
+  }
+
+  // 解析 [start,end) 范围内的顶层盒子，offset/size 均为相对所属 buffer 的绝对偏移
+  function _parseBoxes(u8, start, end) {
+    const boxes = [];
+    const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+    let pos = start;
+    while (pos + 8 <= end) {
+      let size = dv.getUint32(pos, false); // big-endian
+      const type = _boxType(u8, pos);
+      let hs = 8;
+      if (size === 1) { // 64-bit largesize
+        if (pos + 16 > end) break;
+        const hi = dv.getUint32(pos + 8, false);
+        const lo = dv.getUint32(pos + 12, false);
+        size = hi * 0x100000000 + lo;
+        hs = 16;
+      } else if (size === 0) { // 到文件尾
+        size = end - pos;
+      }
+      if (size < 8 || pos + size > end) break;
+      boxes.push({ type, offset: pos, size, headerSize: hs, dataStart: pos + hs, dataEnd: pos + size });
+      pos += size;
+    }
+    return boxes;
+  }
+
+  function _findBox(boxes, type) {
+    for (let i = 0; i < boxes.length; i++) if (boxes[i].type === type) return boxes[i];
+    return null;
+  }
+
+  // 返回 trak 内 tkhd 的 track_id 字段绝对偏移与当前值
+  function _tkhdTidField(u8, trak) {
+    const ch = _parseBoxes(u8, trak.dataStart, trak.dataEnd);
+    const tkhd = _findBox(ch, 'tkhd');
+    if (!tkhd) return null;
+    const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+    const version = u8[tkhd.dataStart];
+    // fullbox: version(1)+flags(3)，之后 creation_time + modification_time
+    // v0: 各 4 字节；v1: 各 8 字节
+    const off = tkhd.dataStart + 4 + (version === 1 ? 16 : 8);
+    return { offset: off, value: dv.getUint32(off, false) };
+  }
+
+  // 返回 moof → traf → tfhd 的 {tidOffset, flags, baseOffRel}
+  //   flags: 判断 base-data-offset(0x01) / default-base-is-moof(0x020000)
+  //   baseOffRel: base-data-offset 字段相对 moof 起点的偏移（仅在存在时有效）
+  function _tfhdInfo(u8, moof) {
+    const mc = _parseBoxes(u8, moof.dataStart, moof.dataEnd);
+    const traf = _findBox(mc, 'traf');
+    if (!traf) return null;
+    const tc = _parseBoxes(u8, traf.dataStart, traf.dataEnd);
+    const tfhd = _findBox(tc, 'tfhd');
+    if (!tfhd) return null;
+    // fullbox: version(1 byte) + flags(3 bytes)
+    const flags = (u8[tfhd.dataStart + 1] << 16) | (u8[tfhd.dataStart + 2] << 8) | u8[tfhd.dataStart + 3];
+    const tidOffset = tfhd.dataStart + 4; // track_id 紧跟 version+flags
+    let baseOffRel = -1;
+    if (flags & 0x01) { // base-data-offset present（8 字节绝对偏移，紧跟 track_id）
+      baseOffRel = (tfhd.dataStart + 8) - moof.offset;
+    }
+    return { tidOffset, flags, baseOffRel };
+  }
+
+  // 收集顶层盒子中的 moof/mdat 对（保持顺序，跳过 styp/sidx/mfra）
+  function _collectFrags(top) {
+    const frags = [];
+    let pend = null;
+    for (let i = 0; i < top.length; i++) {
+      const b = top[i];
+      if (b.type === 'moof') {
+        pend = b;
+      } else if (b.type === 'mdat' && pend) {
+        frags.push({ moof: pend, mdat: b });
+        pend = null;
+      }
+    }
+    return frags;
+  }
+
+  async function fastRemuxMP4(videoBuffer, audioBuffer, filename, ctx) {
+    const vu = new Uint8Array(videoBuffer);
+    const au = new Uint8Array(audioBuffer);
+
+    const vTop = _parseBoxes(vu, 0, vu.length);
+    const aTop = _parseBoxes(au, 0, au.length);
+    const vMoov = _findBox(vTop, 'moov');
+    const aMoov = _findBox(aTop, 'moov');
+    if (!vMoov || !aMoov) throw new Error('快速合并需要 fragmented MP4（缺少 moov）');
+
+    const vMC = _parseBoxes(vu, vMoov.dataStart, vMoov.dataEnd);
+    const aMC = _parseBoxes(au, aMoov.dataStart, aMoov.dataEnd);
+    const vTrak = _findBox(vMC, 'trak');
+    const aTrak = _findBox(aMC, 'trak');
+    const vMvhd = _findBox(vMC, 'mvhd');
+    const vMvex = _findBox(vMC, 'mvex');
+    const aMvex = _findBox(aMC, 'mvex');
+    if (!vTrak || !aTrak || !vMvhd || !vMvex || !aMvex) throw new Error('moov 结构不完整（缺 trak/mvhd/mvex）');
+
+    const vTidF = _tkhdTidField(vu, vTrak);
+    const aTidF = _tkhdTidField(au, aTrak);
+    if (!vTidF || !aTidF) throw new Error('无法读取 track_id');
+    const V_TID = vTidF.value;
+    const A_TID = aTidF.value;
+    const VIDEO_TID = 1;
+    const AUDIO_TID = 2;
+
+    const vMvexCh = _parseBoxes(vu, vMvex.dataStart, vMvex.dataEnd);
+    const vTrex = _findBox(vMvexCh, 'trex');
+    const aMvexCh = _parseBoxes(au, aMvex.dataStart, aMvex.dataEnd);
+    const aTrex = _findBox(aMvexCh, 'trex');
+    if (!vTrex || !aTrex) throw new Error('缺少 trex（非 fragmented MP4）');
+
+    const vFtyp = _findBox(vTop, 'ftyp');
+    if (!vFtyp) throw new Error('缺少 ftyp');
+
+    const vFrags = _collectFrags(vTop);
+    const aFrags = _collectFrags(aTop);
+    if (!vFrags.length) throw new Error('视频流无 moof/mdat 分片（可能为渐进式 MP4）');
+    if (!aFrags.length) throw new Error('音频流无 moof/mdat 分片');
+
+    // 预检 tfhd base 模式：仅支持 default-base-is-moof(0x020000) 或 base-data-offset(0x01)，
+    // 其余（base=0 绝对）移动 moof 后会失效 → 抛错走兜底
+    const checkFrags = (frags, u8) => {
+      for (const f of frags) {
+        const ti = _tfhdInfo(u8, f.moof);
+        if (!ti) throw new Error('moof 缺少 tfhd');
+        if (!((ti.flags & 0x020000) || (ti.flags & 0x01))) {
+          throw new Error('不支持的 tfhd base 模式');
+        }
+      }
+    };
+    checkFrags(vFrags, vu);
+    checkFrags(aFrags, au);
+
+    // ---- 计算输出总大小 ----
+    const moovBodyLen = vMvhd.size + vTrak.size + aTrak.size + (8 + vTrex.size + aTrex.size);
+    const moovLen = 8 + moovBodyLen;
+    const STYP_LEN = 16; // 段类型标记，提升兼容性
+    let total = vFtyp.size + moovLen + STYP_LEN;
+    for (const f of vFrags) total += f.moof.size + f.mdat.size;
+    for (const f of aFrags) total += f.moof.size + f.mdat.size;
+
+    chrome.runtime.sendMessage({
+      type: 'AUDIO_PROGRESS', progress: 60, message: '正在合并音视频轨道（无重编码）...',
+    }).catch(() => {});
+
+    const out = new Uint8Array(total);
+    const dv = new DataView(out.buffer);
+    let w = 0;
+    // 返回写入起点，便于打补丁
+    function emit(u8, off, len) {
+      const s = w;
+      out.set(u8.subarray(off, off + len), s);
+      w += len;
+      return s;
+    }
+    const patch32 = (absOff, val) => dv.setUint32(absOff, val, false);
+    const patch64 = (absOff, val) => {
+      dv.setUint32(absOff, Math.floor(val / 0x100000000) >>> 0, false);
+      dv.setUint32(absOff + 4, val >>> 0, false);
+    };
+
+    // 1) ftyp（沿用视频流的 brand，兼容 avc1/hevc）
+    emit(vu, vFtyp.offset, vFtyp.size);
+
+    // 2) moov：mvhd + video trak + audio trak + mvex(trex×2)
+    const moovStart = w;
+    patch32(w, moovLen);
+    out[w + 4] = 0x6d; out[w + 5] = 0x6f; out[w + 6] = 0x6f; out[w + 7] = 0x76; // 'moov'
+    w += 8;
+
+    // mvhd（拷贝视频 mvhd，修正 next_track_ID = 3）
+    {
+      const s = emit(vu, vMvhd.offset, vMvhd.size);
+      patch32(s + vMvhd.size - 4, 3);
+    }
+    // video trak（拷贝；track_id 不为 1 时改写）
+    {
+      const s = emit(vu, vTrak.offset, vTrak.size);
+      if (V_TID !== VIDEO_TID) patch32(s + (vTidF.offset - vTrak.offset), VIDEO_TID);
+    }
+    // audio trak（拷贝；track_id 改写为 2）
+    {
+      const s = emit(au, aTrak.offset, aTrak.size);
+      patch32(s + (aTidF.offset - aTrak.offset), AUDIO_TID);
+    }
+    // mvex：8 头 + video trex + audio trex
+    {
+      const mvexLen = 8 + vTrex.size + aTrex.size;
+      patch32(w, mvexLen);
+      out[w + 4] = 0x6d; out[w + 5] = 0x76; out[w + 6] = 0x65; out[w + 7] = 0x78; // 'mvex'
+      w += 8;
+      const vs = emit(vu, vTrex.offset, vTrex.size);
+      if (V_TID !== VIDEO_TID) patch32(vs + ((vTrex.dataStart + 4) - vTrex.offset), VIDEO_TID);
+      const as = emit(au, aTrex.offset, aTrex.size);
+      patch32(as + ((aTrex.dataStart + 4) - aTrex.offset), AUDIO_TID);
+    }
+
+    // 3) styp 段标记（major 'msdh'）
+    out.set([0, 0, 0, 0x10, 0x73, 0x74, 0x79, 0x70, 0x6d, 0x73, 0x64, 0x68, 0, 0, 0, 0], w);
+    w += STYP_LEN;
+
+    chrome.runtime.sendMessage({
+      type: 'AUDIO_PROGRESS', progress: 80, message: '正在写入媒体分片...',
+    }).catch(() => {});
+
+    // 4) 分片：先视频后音频。每个 moof 紧跟其 mdat，trun data_offset 相对 moof 起点仍有效。
+    const emitFrags = (u8, frags, fromTid, toTid) => {
+      for (const f of frags) {
+        const moofOutStart = emit(u8, f.moof.offset, f.moof.size);
+        const ti = _tfhdInfo(u8, f.moof);
+        if (ti) {
+          if (fromTid !== toTid) patch32(moofOutStart + (ti.tidOffset - f.moof.offset), toTid);
+          if (ti.baseOffRel >= 0) patch64(moofOutStart + ti.baseOffRel, moofOutStart);
+        }
+        emit(u8, f.mdat.offset, f.mdat.size);
+      }
+    };
+    emitFrags(vu, vFrags, V_TID, VIDEO_TID);
+    emitFrags(au, aFrags, A_TID, AUDIO_TID);
+
+    // 兼容性提示：若视频为 HEVC/AV1，Chrome <video> 可能无法播放但文件有效
+    try {
+      const codecs = detectCodecFromMP4(videoBuffer);
+      const hasHEVC = codecs.some(c => /hev1|hvc1/i.test(c));
+      const hasAV1 = codecs.some(c => /av01/i.test(c));
+      if (hasHEVC || hasAV1) {
+        chrome.runtime.sendMessage({
+          type: 'AUDIO_PROGRESS', progress: 92,
+          message: '提示：视频为 ' + (hasHEVC ? 'HEVC' : 'AV1') + '，已无损合并，Chrome 或无法播放但文件有效',
+        }).catch(() => {});
+      }
+    } catch (e) {}
+
+    // 5) 下载
+    chrome.runtime.sendMessage({
+      type: 'AUDIO_PROGRESS', progress: 95, message: '合并完成，正在保存...',
+    }).catch(() => {});
+
+    const blob = new Blob([out], { type: 'video/mp4' });
+    const url = URL.createObjectURL(blob);
+    try {
+      await chrome.downloads.download({ url, filename: `${filename}.mp4`, saveAs: false });
+      setTimeout(() => { try { URL.revokeObjectURL(url); } catch (e) {} }, 60000);
+    } catch (e) {
+      try { URL.revokeObjectURL(url); } catch (e2) {}
+      throw new Error('下载失败: ' + e.message);
+    }
+    return { success: true, ext: 'mp4' };
+  }
+
+  // ==================== 视频+音频合并（MediaRecorder 实时录制兜底） ====================
 
   function pickRecorderMime() {
     const candidates = [
@@ -728,7 +991,25 @@
             message: '正在初始化合并...',
           }).catch(() => {});
 
-          const result = await mergeVideoAudio(videoBuffer, audioBuffer, filename, mergeId, tabId, ctx);
+          // 优先走快速无重编码 remux（fMP4 → 秒级合并）；
+          // 失败（非 fMP4 / 结构异常）回退到 MediaRecorder 实时录制
+          let result;
+          try {
+            chrome.runtime.sendMessage({
+              type: 'AUDIO_PROGRESS',
+              progress: 52,
+              message: '快速合并：解析 fragmented MP4（无重编码）...',
+            }).catch(() => {});
+            result = await fastRemuxMP4(videoBuffer, audioBuffer, filename, ctx);
+          } catch (e) {
+            console.log('[VC-Offscreen] 快速合并不可用，回退实时录制:', e.message);
+            chrome.runtime.sendMessage({
+              type: 'AUDIO_PROGRESS',
+              progress: 50,
+              message: '快速模式不可用，切换实时录制...',
+            }).catch(() => {});
+            result = await mergeVideoAudio(videoBuffer, audioBuffer, filename, mergeId, tabId, ctx);
+          }
 
           sendResponse({ success: true, ext: result.ext });
         } catch (e) {
