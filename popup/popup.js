@@ -13,6 +13,12 @@
   // B站合并卡片：audioMediaId → videoMediaId（卡片进度条/按钮挂在 videoMedia.id 上）
   const combinedAnchor = new Map();
 
+  // URL 扫描视图：'page' = 当前标签页；'scan' = 搜索栏扫描结果
+  // scanTabId 为 SW 内存中的虚拟 key（"scan_<tabId>"），下载/预估请求须带回
+  let viewMode = 'page';
+  let scanTabId = null;
+  let scanUrl = '';
+
   // ==================== 下载大小预估 ====================
   function formatBytes(n) {
     if (n === null || n === undefined || isNaN(n) || n <= 0) return '未知';
@@ -63,6 +69,7 @@
         mode,
         qualityIndex,
         audioFormat,
+        tabId: scanTabIdArg(),
       });
       el.innerHTML = formatEstimate(resp);
     } catch (e) {
@@ -90,6 +97,16 @@
       }
     });
 
+    // 搜索栏：输入网址 → 检测该页面包含的视频
+    const scanBtn = document.getElementById('url-scan-btn');
+    const urlInput = document.getElementById('url-input');
+    if (scanBtn) scanBtn.addEventListener('click', handleScanUrl);
+    if (urlInput) {
+      urlInput.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') handleScanUrl();
+      });
+    }
+
     // 先渲染媒体卡片，再恢复后台任务（任务联动卡片依赖卡片已存在）
     await loadMediaList();
     await refreshTasks();
@@ -97,6 +114,9 @@
 
   // ==================== 加载媒体列表 ====================
   async function loadMediaList() {
+    viewMode = 'page';
+    scanTabId = null;
+    hideScanBar();
     showLoading();
     try {
       const response = await chrome.runtime.sendMessage({ type: 'GET_MEDIA_LIST' });
@@ -110,6 +130,98 @@
     } catch (e) {
       showError('无法连接到后台服务: ' + e.message);
     }
+  }
+
+  // ==================== URL 扫描（搜索栏输入网址检测视频） ====================
+  // 流程：输入网址 → SW 后台标签页加载该页（content script + 网络拦截 + B站 playinfo）
+  // + 静态 HTML 扫描兜底 → 返回媒体列表 → 复用现有卡片渲染与后台下载链路。
+  // 下载/预估请求需携带扫描结果的虚拟 tabId，SW 关闭探测标签页后仍可定位媒体。
+
+  async function handleScanUrl() {
+    const input = document.getElementById('url-input');
+    const btn = document.getElementById('url-scan-btn');
+    const raw = (input?.value || '').trim();
+    if (!raw || viewMode === 'scanning') return;
+
+    viewMode = 'scanning';
+    if (btn) { btn.disabled = true; btn.textContent = '检测中…'; }
+    document.getElementById('content').innerHTML = `
+      <div class="empty-state">
+        <div class="scan-loading-icon">🔍</div>
+        <div class="title">正在检测网页视频...</div>
+        <div class="desc">已在后台打开该页面并分析，<br>通常需要 5~15 秒</div>
+      </div>`;
+
+    try {
+      const resp = await chrome.runtime.sendMessage({ type: 'SCAN_URL', url: raw });
+      if (resp && resp.error) {
+        viewMode = 'page';
+        showError(resp.error);
+      } else if (resp && Array.isArray(resp.mediaList) && resp.mediaList.length > 0) {
+        viewMode = 'scan';
+        scanTabId = resp.tabId || null;
+        scanUrl = resp.scanUrl || raw;
+        currentMediaList = resp.mediaList;
+        currentSite = resp.site || 'general';
+        showScanBar();
+        renderUI({ mediaList: resp.mediaList, site: resp.site, downloadProgress: null });
+      } else {
+        viewMode = 'scan';
+        scanUrl = resp?.scanUrl || raw;
+        scanTabId = resp?.tabId || null;
+        renderScanEmpty(resp);
+      }
+    } catch (e) {
+      viewMode = 'page';
+      showError('扫描请求失败: ' + e.message);
+    } finally {
+      viewMode = viewMode === 'scanning' ? 'page' : viewMode;
+      if (btn) { btn.disabled = false; btn.textContent = '🔍 检测'; }
+    }
+  }
+
+  function showScanBar() {
+    const bar = document.getElementById('scan-bar');
+    if (!bar) return;
+    bar.style.display = 'flex';
+    bar.innerHTML = `
+      <span class="scan-label">🔎 来源</span>
+      <span class="scan-url" title="${escapeHtml(scanUrl)}">${escapeHtml(scanUrl)}</span>
+      <button class="btn-scan-back" id="scan-back-btn">← 当前页面</button>`;
+    const backBtn = document.getElementById('scan-back-btn');
+    if (backBtn) backBtn.addEventListener('click', backToCurrentPage);
+  }
+
+  function hideScanBar() {
+    const bar = document.getElementById('scan-bar');
+    if (bar) { bar.style.display = 'none'; bar.innerHTML = ''; }
+  }
+
+  function backToCurrentPage() {
+    loadMediaList();
+  }
+
+  function renderScanEmpty(resp) {
+    showScanBar();
+    document.getElementById('content').innerHTML = `
+      <div class="empty-state">
+        <div class="icon">🔍</div>
+        <div class="title">未在该网页检测到视频</div>
+        <div class="desc">${escapeHtml(resp?.hint || '该页面可能没有视频，或需要播放后才加载视频流')}</div>
+        <button class="btn btn-primary" style="margin-top:16px;max-width:200px;" id="scan-open-page">↗ 打开该页面手动播放</button>
+      </div>`;
+    const openBtn = document.getElementById('scan-open-page');
+    if (openBtn) {
+      openBtn.addEventListener('click', () => {
+        chrome.tabs.create({ url: scanUrl, active: true });
+        window.close();
+      });
+    }
+  }
+
+  // 扫描视图下的下载/预估请求需携带扫描虚拟 tabId
+  function scanTabIdArg() {
+    return viewMode === 'scan' ? scanTabId : undefined;
   }
 
   // ==================== 渲染 UI ====================
@@ -173,7 +285,11 @@
     toolbar.style.cssText = 'display:flex;justify-content:flex-end;margin-bottom:8px;';
     toolbar.innerHTML = `<button class="btn btn-secondary" style="flex:none;padding:6px 12px;font-size:12px;" id="refresh-btn">🔄 刷新</button>`;
     content.appendChild(toolbar);
-    document.getElementById('refresh-btn').addEventListener('click', loadMediaList);
+    document.getElementById('refresh-btn').addEventListener('click', () => {
+      // 扫描视图下刷新 = 重新扫描该网址；当前页视图 = 重新检测当前页
+      if (viewMode === 'scan' && scanUrl) handleScanUrl();
+      else loadMediaList();
+    });
 
     // B站提示
     if (site === 'bilibili') {
@@ -515,6 +631,7 @@
         audioMediaId: audioMedia.id,
         videoQualityIndex: vIndex,
         audioQualityIndex: 0, // 音频默认最高码率
+        tabId: scanTabIdArg(),
       });
       if (resp && resp.error) {
         showProgress(videoMedia.id, -1, '❌ ' + resp.error);
@@ -721,6 +838,7 @@
         type: 'DOWNLOAD_VIDEO',
         mediaId: media.id,
         qualityIndex: qIndex,
+        tabId: scanTabIdArg(),
       });
       if (resp && resp.error) {
         showProgress(media.id, -1, '❌ ' + resp.error);
@@ -760,6 +878,7 @@
         format: format,
         bitrate: bitrate,
         qualityIndex: qIndex,
+        tabId: scanTabIdArg(),
       });
       if (resp && resp.error) {
         showProgress(media.id, -1, '❌ ' + resp.error);

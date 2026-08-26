@@ -10,6 +10,13 @@
     <span>视频抓取助手</span>
     <span class="subtitle" id="site-badge"></span>
   </div>
+  <!-- 搜索栏：输入网址，自动检测该页面包含的视频 -->
+  <div class="search-bar">
+    <input type="text" id="url-input" placeholder="输入网址，检测页面中的视频" spellcheck="false" autocomplete="off">
+    <button class="btn btn-primary" id="url-scan-btn" style="flex:none;padding:7px 12px;font-size:12px;">🔍 检测</button>
+  </div>
+  <!-- URL 扫描结果来源条（仅扫描视图显示） -->
+  <div class="scan-bar" id="scan-bar" style="display:none;"></div>
   <!-- 后台下载任务区：任务常驻 offscreen 执行，关闭弹窗不中断 -->
   <div class="tasks" id="tasks" style="display:none;"></div>
   <div class="content" id="content">

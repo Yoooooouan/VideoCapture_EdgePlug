@@ -91,6 +91,22 @@ function clearTabState(tabId) {
   }
 }
 
+// 按 mediaId 查找媒体与其所属 state：
+// 优先在指定 tab（或 URL 扫描结果的虚拟 key "scan_<tabId>"）中查找，
+// 找不到时全局兜底——扫描结果标签页已关闭，state 挂在虚拟 key 上。
+function findMediaAndState(mediaId, preferTabId) {
+  if (preferTabId !== undefined && preferTabId !== null) {
+    const st = tabStates.get(preferTabId);
+    const m = st?.mediaList?.find(x => x.id === mediaId);
+    if (m) return { media: m, state: st };
+  }
+  for (const st of tabStates.values()) {
+    const m = st.mediaList?.find(x => x.id === mediaId);
+    if (m) return { media: m, state: st };
+  }
+  return null;
+}
+
 // ==================== 网络请求拦截 ====================
 
 chrome.webRequest.onBeforeRequest.addListener(
@@ -455,6 +471,205 @@ async function fetchHLSVariants(m3u8Url) {
   }
 }
 
+// 确保 HLS 清晰度选项已加载（GET_MEDIA_LIST 与 URL 扫描共用）
+async function ensureHlsQualityOptions(mediaList) {
+  for (const media of mediaList) {
+    if (media.type === 'hls' && (!media.qualityOptions || media.qualityOptions.length <= 1)) {
+      try {
+        const variants = await fetchHLSVariants(media.url);
+        if (variants && variants.length > 1) {
+          media.qualityOptions = variants.map((v, i) => ({
+            label: v.resolution || `${Math.round(v.bandwidth / 1000)}kbps`,
+            bandwidth: v.bandwidth,
+            url: v.url,
+            index: i,
+          }));
+        }
+      } catch (e) {}
+    }
+  }
+}
+
+// ==================== URL 扫描（搜索栏输入网址检测视频） ====================
+
+// 从 HTML 源码提取视频直链：video/source 标签属性、og:video meta、
+// 以及 JS/JSON 内嵌的裸 .mp4/.m3u8 等地址（覆盖懒加载与动态站点）。
+function extractVideosFromHtml(html, baseUrl) {
+  const found = new Map();
+
+  const addUrl = (rawUrl) => {
+    if (!rawUrl) return;
+    const url = resolveUrl(rawUrl.trim().replace(/&amp;/g, '&'), baseUrl);
+    if (!/^https?:/i.test(url)) return;
+    const extM = url.match(MEDIA_EXT_RE);
+    if (!extM) return;
+    const ext = extM[1].toLowerCase();
+    if (ext === 'ts') return; // TS 分段由 m3u8 任务统一处理
+    let type = 'video';
+    if (ext === 'm3u8') type = 'hls';
+    else if (['m4a', 'aac', 'mp3', 'wav', 'flac', 'ogg'].includes(ext)) type = 'audio';
+    else if (ext === 'm4s') type = 'dash';
+    if (!found.has(url)) found.set(url, { url, ext, type });
+  };
+
+  // <video>/<audio>/<source> 标签属性、og:video meta
+  const attrRes = [
+    /<video[^>]+?\b(?:src|data-src|data-original)\s*=\s*["']([^"']+)["']/gi,
+    /<source[^>]+?\b(?:src|data-src)\s*=\s*["']([^"']+)["']/gi,
+    /<audio[^>]+?\b(?:src|data-src)\s*=\s*["']([^"']+)["']/gi,
+    /<meta[^>]+property=["']og:video(?::secure_url|:url)?["'][^>]*?content=["']([^"']+)["']/gi,
+    /<meta[^>]+content=["']([^"']+)["'][^>]*?property=["']og:video(?::secure_url|:url)?["']/gi,
+  ];
+  for (const re of attrRes) {
+    let m;
+    while ((m = re.exec(html)) !== null) addUrl(m[1]);
+  }
+
+  // 裸 URL：覆盖 <script> 内嵌变量、JSON 数据里的视频地址（含协议相对 // 写法）
+  const rawUrlRe = /(?:https?:)?\/\/[^\s"'<>()\\]+?\.(?:m3u8|mp4|webm|flv|m4s)(?:\?[^\s"'<>()\\]*)?/gi;
+  let m;
+  while ((m = rawUrlRe.exec(html)) !== null) addUrl(m[0]);
+
+  return [...found.values()];
+}
+
+// 等待标签页加载完成（status=complete），带超时兜底；标签页被关掉也立即返回
+function waitForTabComplete(tabId, timeoutMs = 20000) {
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      chrome.tabs.onUpdated.removeListener(listener);
+      chrome.tabs.onRemoved.removeListener(removedListener);
+      clearTimeout(timer);
+      resolve();
+    };
+    const listener = (updatedTabId, changeInfo) => {
+      if (updatedTabId === tabId && changeInfo.status === 'complete') {
+        setTimeout(finish, 300); // 部分站点 complete 后仍有二次跳转，稍候
+      }
+    };
+    const removedListener = (removedTabId) => {
+      if (removedTabId === tabId) finish();
+    };
+    const timer = setTimeout(finish, timeoutMs);
+    chrome.tabs.onUpdated.addListener(listener);
+    chrome.tabs.onRemoved.addListener(removedListener);
+  });
+}
+
+// 执行 URL 扫描：后台标签页加载目标网址（content script + webRequest 自动采集），
+// 并行做静态 HTML 扫描兜底；B站额外提取 playinfo。
+// 结果 state 搬到虚拟 key "scan_<tabId>"（标签页随后关闭，下载走 offscreen 按 URL 执行不依赖页面）。
+async function scanUrlForVideos(rawUrl) {
+  // 1. URL 规范化
+  let url = (rawUrl || '').trim();
+  if (!url) throw new Error('请输入网址');
+  if (!/^https?:\/\//i.test(url)) url = 'https://' + url;
+  let parsed;
+  try {
+    parsed = new URL(url);
+  } catch (e) {
+    throw new Error('无效的网址: ' + url);
+  }
+  if (!/^https?:$/.test(parsed.protocol)) throw new Error('仅支持 http/https 网址');
+
+  // 2. 清理上一次扫描的残留结果
+  for (const key of [...tabStates.keys()]) {
+    if (typeof key === 'string' && key.startsWith('scan_')) tabStates.delete(key);
+  }
+
+  // 3. 静态 HTML 扫描（与打开标签页并行；非 HTML / 超大页面 / 失败均静默放弃）
+  const staticScanPromise = (async () => {
+    try {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), 12000);
+      const resp = await fetch(url, { signal: ctrl.signal, credentials: 'omit' });
+      clearTimeout(timer);
+      const contentType = resp.headers.get('content-type') || '';
+      if (contentType && !contentType.includes('text/html')) return [];
+      const html = await resp.text();
+      if (html.length > 5 * 1024 * 1024) return [];
+      return extractVideosFromHtml(html, url);
+    } catch (e) {
+      return [];
+    }
+  })();
+
+  // 4. 后台打开页面（active:false 不抢焦点）
+  const scanTab = await chrome.tabs.create({ url, active: false });
+  const scanTabId = scanTab.id;
+
+  try {
+    await waitForTabComplete(scanTabId);
+    // 等待 JS 渲染、媒体请求发出、content script 上报
+    await new Promise(r => setTimeout(r, 4000));
+
+    const state = getTabState(scanTabId);
+    state.url = url;
+    state.site = /bilibili\.com/.test(url) ? 'bilibili'
+      : /douyin\.com/.test(url) ? 'douyin' : 'general';
+
+    // 5. B站 playinfo 主动提取（页面服务端渲染，加载完成即在 window 上）
+    if (state.site === 'bilibili' && !state.playinfo) {
+      try {
+        state.playinfo = await getBilibiliPlayinfo(scanTabId);
+      } catch (e) {}
+      if (state.playinfo) {
+        const biliList = buildBilibiliMediaList(state.playinfo, state.title);
+        // 去重规则与 GET_MEDIA_LIST 一致（三层去重见项目记忆）
+        state.mediaList = state.mediaList.filter(m => {
+          if (m.source === 'bilibili') return false;
+          if (m.source === 'network' && BILIBILI_CDN_RE.test(m.url)) return false;
+          return true;
+        });
+        state.mediaList.unshift(...biliList);
+      }
+    }
+
+    // 6. 合并静态扫描结果（去重追加）
+    const staticResults = await staticScanPromise;
+    for (const item of staticResults) {
+      if (state.mediaUrlSet.has(item.url)) continue;
+      state.mediaUrlSet.add(item.url);
+      state.mediaList.push({
+        id: `scan_${scanTabId}_${Date.now()}_${state.mediaList.length}`,
+        url: item.url,
+        type: item.type,
+        title: state.title || parsed.hostname,
+        format: item.ext,
+        duration: 0,
+        poster: '',
+        detectedAt: Date.now(),
+        source: 'scan-html',
+        qualityOptions: [],
+        selectedQuality: 0,
+      });
+    }
+
+    // 7. HLS 清晰度选项
+    await ensureHlsQualityOptions(state.mediaList);
+
+    // 8. state 搬到虚拟 key 并关闭探测标签页
+    //    （Map 的 number key 与字符串 key 互不相同，onRemoved 的 delete 不影响虚拟 key）
+    const virtualKey = `scan_${scanTabId}`;
+    tabStates.set(virtualKey, state);
+    try { await chrome.tabs.remove(scanTabId); } catch (e) {}
+
+    return {
+      mediaList: state.mediaList,
+      title: state.title,
+      site: state.site,
+      scanUrl: url,
+      tabId: virtualKey,
+    };
+  } catch (e) {
+    try { await chrome.tabs.remove(scanTabId); } catch (_) {}
+    throw e;
+  }
+}
+
 // ==================== 下载工具函数 ====================
 
 function sanitizeFilename(title) {
@@ -582,23 +797,45 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (!tabId) return;
 
     const state = getTabState(tabId);
-    // 避免重复
-    if (state.mediaUrlSet.has(message.video.src)) return;
-    state.mediaUrlSet.add(message.video.src);
+    const src = message.video.src || '';
+    const isBlob = src.startsWith('blob:');
 
-    const isBlob = message.video.src.startsWith('blob:');
-    state.mediaList.push({
-      id: `video_el_${tabId}_${Date.now()}_${state.mediaList.length}`,
-      url: message.video.src,
-      type: isBlob ? 'blob' : 'video',
-      title: state.title || '未命名视频',
-      format: isBlob ? 'blob' : (message.video.src.match(MEDIA_EXT_RE)?.[1]?.toLowerCase() || 'unknown'),
-      duration: message.video.duration || 0,
-      poster: message.video.poster || '',
-      detectedAt: Date.now(),
-      source: 'video-element',
-      qualityOptions: [],
-      selectedQuality: 0,
+    // 主 src（后台标签页中 autoplay 被阻止时 src 可能为空，此时跳过）
+    if (src && !state.mediaUrlSet.has(src)) {
+      state.mediaUrlSet.add(src);
+      state.mediaList.push({
+        id: `video_el_${tabId}_${Date.now()}_${state.mediaList.length}`,
+        url: src,
+        type: isBlob ? 'blob' : 'video',
+        title: state.title || '未命名视频',
+        format: isBlob ? 'blob' : (src.match(MEDIA_EXT_RE)?.[1]?.toLowerCase() || 'unknown'),
+        duration: message.video.duration || 0,
+        poster: message.video.poster || '',
+        detectedAt: Date.now(),
+        source: 'video-element',
+        qualityOptions: [],
+        selectedQuality: 0,
+      });
+    }
+
+    // source 子元素（video.src 为空或为 blob 时，直链常在 <source> 里）
+    (message.video.sources || []).forEach((s) => {
+      if (!s.src || !/^https?:/i.test(s.src)) return;
+      if (state.mediaUrlSet.has(s.src)) return;
+      state.mediaUrlSet.add(s.src);
+      state.mediaList.push({
+        id: `video_src_${tabId}_${Date.now()}_${state.mediaList.length}`,
+        url: s.src,
+        type: 'video',
+        title: state.title || '未命名视频',
+        format: s.src.match(MEDIA_EXT_RE)?.[1]?.toLowerCase() || 'unknown',
+        duration: message.video.duration || 0,
+        poster: message.video.poster || '',
+        detectedAt: Date.now(),
+        source: 'video-element',
+        qualityOptions: [],
+        selectedQuality: 0,
+      });
     });
     return;
   }
@@ -660,21 +897,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         }
 
         // 确保 HLS 清晰度选项已加载
-        for (const media of state.mediaList) {
-          if (media.type === 'hls' && (!media.qualityOptions || media.qualityOptions.length <= 1)) {
-            try {
-              const variants = await fetchHLSVariants(media.url);
-              if (variants && variants.length > 1) {
-                media.qualityOptions = variants.map((v, i) => ({
-                  label: v.resolution || `${Math.round(v.bandwidth / 1000)}kbps`,
-                  bandwidth: v.bandwidth,
-                  url: v.url,
-                  index: i,
-                }));
-              }
-            } catch (e) {}
-          }
-        }
+        await ensureHlsQualityOptions(state.mediaList);
 
         sendResponse({
           mediaList: state.mediaList,
@@ -694,21 +917,43 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true; // 保持消息通道
   }
 
+  // ----- URL 扫描（搜索栏输入网址，检测该页面包含的视频） -----
+  if (message.type === 'SCAN_URL') {
+    (async () => {
+      try {
+        const result = await scanUrlForVideos(message.url);
+        if (!result.mediaList || result.mediaList.length === 0) {
+          sendResponse({
+            ...result,
+            hint: '未在该页面检测到可下载视频。部分网站需播放视频后才会加载视频流，可尝试直接打开该页面播放后再检测。',
+          });
+          return;
+        }
+        sendResponse(result);
+      } catch (e) {
+        console.error('[VC] URL 扫描失败:', e);
+        sendResponse({ error: e.message || String(e) });
+      }
+    })();
+    return true;
+  }
+
   if (message.type === 'DOWNLOAD_MERGE') {
     (async () => {
       const { videoMediaId, audioMediaId, videoQualityIndex, audioQualityIndex, tabId: msgTabId } = message;
       try {
-        const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-        const tabId = tab?.id || msgTabId;
-        const state = getTabState(tabId);
-
-        const videoMedia = state.mediaList.find(m => m.id === videoMediaId);
-        const audioMedia = state.mediaList.find(m => m.id === audioMediaId);
+        // 消息 tabId 优先（URL 扫描结果存于虚拟 key），找不到再全局兜底
+        const foundV = findMediaAndState(videoMediaId, msgTabId);
+        const foundA = findMediaAndState(audioMediaId, msgTabId);
+        const videoMedia = foundV?.media;
+        const audioMedia = foundA?.media;
 
         if (!videoMedia || !audioMedia) {
           sendResponse({ error: '未找到视频或音频流' });
           return;
         }
+        const state = foundV?.state || foundA?.state;
+        const tabId = msgTabId || (await chrome.tabs.query({ active: true, currentWindow: true }))[0]?.id;
 
         const title = sanitizeFilename(videoMedia.title);
         const vQ = videoMedia.qualityOptions[videoQualityIndex || 0] || videoMedia.qualityOptions[0];
@@ -720,7 +965,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
         // 组装诊断上下文（出错时 offscreen 会基于此生成 Bug 报告）
         const ctx = {
-          pageUrl: state.url || tab.url || '',
+          pageUrl: state?.url || '',
           videoUrl: vQ.url,
           audioUrl: aQ.url,
           qualityLabel: vQ.label || '',
@@ -754,14 +999,14 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     (async () => {
       const { mediaId, qualityIndex, tabId: msgTabId } = message;
       try {
-        const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-        const tabId = tab?.id || msgTabId;
-        const state = getTabState(tabId);
-        const media = state.mediaList.find(m => m.id === mediaId);
-        if (!media) {
+        // 消息 tabId 优先（URL 扫描结果存于虚拟 key），找不到再全局兜底
+        const found = findMediaAndState(mediaId, msgTabId);
+        if (!found) {
           sendResponse({ error: '未找到媒体' });
           return;
         }
+        const { media } = found;
+        const tabId = msgTabId || (await chrome.tabs.query({ active: true, currentWindow: true }))[0]?.id;
 
         const title = sanitizeFilename(media.title);
         const taskId = makeTaskId();
@@ -807,14 +1052,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     (async () => {
       const { mediaId, format, bitrate, qualityIndex, tabId: msgTabId } = message;
       try {
-        const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-        const tabId = tab?.id || msgTabId;
-        const state = getTabState(tabId);
-        const media = state.mediaList.find(m => m.id === mediaId);
-        if (!media) {
+        // 消息 tabId 优先（URL 扫描结果存于虚拟 key），找不到再全局兜底
+        const found = findMediaAndState(mediaId, msgTabId);
+        if (!found) {
           sendResponse({ error: '未找到媒体' });
           return;
         }
+        const { media, state } = found;
+        const stateUrl = state?.url || '';
+        const tabId = msgTabId || (await chrome.tabs.query({ active: true, currentWindow: true }))[0]?.id;
 
         // 设置选中的清晰度
         if (qualityIndex !== undefined && media.qualityOptions[qualityIndex]) {
@@ -839,7 +1085,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             url,
             backupUrl: qOpt?.backupUrl || '',
             codecs: qOpt?.codecs || '',
-            ctx: { pageUrl: state.url || '', videoUrl: url, qualityLabel: qOpt?.label || '' },
+            ctx: { pageUrl: stateUrl, videoUrl: url, qualityLabel: qOpt?.label || '' },
           };
         } else if (media.type === 'hls') {
           // 从 HLS 视频流提取音频
@@ -847,14 +1093,14 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             sourceType: 'hls',
             url: media.url,
             qualityIndex: media.selectedQuality,
-            ctx: { pageUrl: state.url || '', videoUrl: media.url },
+            ctx: { pageUrl: stateUrl, videoUrl: media.url },
           };
         } else {
           // 从直接 URL 视频流提取音频
           spec = {
             sourceType: 'direct',
             url: media.url,
-            ctx: { pageUrl: state.url || '', videoUrl: media.url },
+            ctx: { pageUrl: stateUrl, videoUrl: media.url },
           };
         }
 
@@ -902,11 +1148,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     (async () => {
       try {
         const { mediaId, mode, qualityIndex, audioFormat, tabId: msgTabId } = message;
-        const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-        const tabId = tab?.id || msgTabId;
-        const state = getTabState(tabId);
-        const media = state.mediaList.find(m => m.id === mediaId);
-        if (!media) { sendResponse({ error: '未找到媒体' }); return; }
+        // 消息 tabId 优先（URL 扫描结果存于虚拟 key），找不到再全局兜底
+        const found = findMediaAndState(mediaId, msgTabId);
+        if (!found) { sendResponse({ error: '未找到媒体' }); return; }
+        const { media } = found;
 
         const qIndex = qualityIndex || 0;
         const est = estimateMediaSize(media, {

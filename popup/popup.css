@@ -42,6 +42,89 @@ body {
   margin-left: auto;
 }
 
+/* ===== Search Bar（URL 扫描） ===== */
+.search-bar {
+  display: flex;
+  gap: 8px;
+  padding: 10px 12px;
+  background: #fff;
+  border-bottom: 1px solid #e8e8e8;
+}
+
+.search-bar input {
+  flex: 1;
+  min-width: 0;
+  padding: 7px 10px;
+  border: 1px solid #ddd;
+  border-radius: 8px;
+  font-size: 12px;
+  color: #1a1a2e;
+  outline: none;
+  background: #fafafa;
+  transition: border-color 0.15s, background 0.15s;
+}
+
+.search-bar input:focus {
+  border-color: #4a90d9;
+  background: #fff;
+}
+
+.search-bar input::placeholder {
+  color: #bbb;
+}
+
+/* ===== Scan Source Bar（扫描结果来源条） ===== */
+.scan-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  background: #e8f0fe;
+  border-bottom: 1px solid #d2e3fc;
+  font-size: 11px;
+}
+
+.scan-bar .scan-label {
+  flex: none;
+}
+
+.scan-bar .scan-url {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: #1a56b8;
+  direction: rtl; /* 长网址靠右截断，保留尾部路径更易辨认 */
+  text-align: left;
+}
+
+.scan-bar .btn-scan-back {
+  flex: none;
+  border: none;
+  background: none;
+  color: #1a73e8;
+  font-size: 11px;
+  cursor: pointer;
+  padding: 2px 4px;
+  white-space: nowrap;
+}
+
+.scan-bar .btn-scan-back:hover {
+  text-decoration: underline;
+}
+
+@keyframes scanPulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.3; }
+}
+
+.scan-loading-icon {
+  font-size: 48px;
+  margin-bottom: 12px;
+  animation: scanPulse 1.2s ease-in-out infinite;
+}
+
 /* ===== Content Area ===== */
 .content {
   padding: 12px;
